@@ -62,6 +62,10 @@ This project is an independent, clean-room open-source implementation and is **n
   - Prevents desktop browser session corruption and permission issues by disallowing accidental `sudo enroll` (`--allow-root` override available).
   - Validates privileges on Linux for TUN interface creation, prompting clear instructions for `sudo` or unprivileged `--proxy-only`.
   - Discovers active official Cisco Secure Client background daemons (`csc_zta_agent`, `acsockd`, `vpnagentd`) and prevents interface collisions (`-f` / `--force` override available).
+- **Non-Blocking Update Notifications:**
+  - Automatically notifies users on `stderr` when a new release is published on GitHub, without adding latency or blocking CLI command execution.
+  - Employs a 24-hour local disk cache (`.update_cache.json`), GitHub redirect inspection to bypass API rate limits, and SemVer version comparison.
+  - Can be disabled at any time via the `OPEN_CISCO_ZTA_NO_UPDATE_CHECK=1` or `CI=1` environment variables.
 
 ---
 
@@ -408,7 +412,8 @@ open-cisco-zta/
 ├── ztna_config.json       # Cached resource routing rules (CIDR / FQDN lists)
 ├── client_cert.pem        # Signed mTLS client certificate chain
 ├── client_key.pem         # Client EC P-256 private key
-└── machine_id             # Persistent hardware UDID for posture stability
+├── machine_id             # Persistent hardware UDID for posture stability
+└── .update_cache.json     # Cached latest release version and check timestamp
 ```
 
 ---
@@ -439,7 +444,8 @@ open-cisco-zta/
     │   ├── browser.rs       # Automated DevTools SSO token capture (Edge/Chrome/Brave)
     │   ├── enroll.rs        # Bootstrap, device registration, and DHA posture registration
     │   ├── sync.rs          # Dynamic config synchronization with ETag caching
-    │   └── system_check.rs  # Pre-flight privilege checks & Cisco daemon conflict detection
+    │   ├── system_check.rs  # Pre-flight privilege checks & Cisco daemon conflict detection
+    │   └── update_check.rs  # Non-blocking GitHub release update notifier & caching
     ├── crypto/              # Cryptographic operations
     │   ├── acme.rs          # RFC 8555 ACME client for Cisco custom ZtnaUriList
     │   ├── dpop.rs          # RFC 9449 DPoP proof signer (ES256)
@@ -474,7 +480,7 @@ To set clear expectations, here is what `open-cisco-zta` explicitly **does NOT**
 | **Cisco ISE Posture / HostScan (OPSWAT)** | Scans endpoints for installed antivirus definitions, registry values, personal firewall state, USB mass-storage restrictions, and executes remediation scripts. | **No deep posture scanning.** Only transmits baseline/spoofed Acidex metadata (`x-acidex-*`) required to satisfy cloud proxy HTTP/2 headers. |
 | **Network Visibility Module (NVM)** | Collects IPFIX telemetry, endpoint process paths, user sessions, and sends flow data to Cisco Splunk / Stealthwatch for network surveillance. | **No user or process tracking.** Zero telemetry or flow logs are collected or reported. |
 | **ThousandEyes Endpoint Agent** | Conducts automated synthetic network path tests, VoIP metric collection, and browser session monitoring. | **No synthetic monitoring.** No synthetic network probes or browser agents are bundled. |
-| **Cisco Cloud Management (CCM) & Auto-Updates** | Connects to central Cisco cloud management for remote administrator policy pushes, silent background binary updates, and remote configuration locks. | **No remote management or auto-updates.** Completely under local user control. Binaries must be updated manually. |
+| **Cisco Cloud Management (CCM) & Auto-Updates** | Connects to central Cisco cloud management for remote administrator policy pushes, silent background binary updates, and remote configuration locks. | **No remote management or silent auto-updates.** Completely under local user control. Binaries must be updated manually; a non-blocking notification banner is shown when a newer release is published. |
 | **Desktop GUI / System Tray Applet** | Provides Qt-based desktop UI (`vpnui`), tray icons, popups, and graphical status graphs. | **Headless / CLI only.** Designed as a lean CLI daemon for servers, containers, developers, and terminal environments. |
 | **Raw UDP Tunneling over ZTNA** | Some enterprise private applications require raw UDP datagram forwarding. | **TCP-only tunneling.** Cisco Secure Access ZTNA tunnels private application traffic over HTTP/2 `CONNECT` streams. We tunnel all TCP-based corporate applications (SSH, HTTP/HTTPS, databases, Git, Kubernetes, remote desktops); raw UDP outside DNS is not tunneled. |
 

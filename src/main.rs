@@ -130,7 +130,13 @@ async fn main() -> Result<()> {
         ConfigManager::new()
     };
 
-    match cli.command {
+    // Non-blocking update check:
+    // 1. Read existing cached release version (instant disk read).
+    let cached_update = open_cisco_zta::control::get_cached_update(config_mgr.base_dir());
+    // 2. If cache is stale (>24h), spawn a background check task.
+    let update_task = open_cisco_zta::control::spawn_background_check(config_mgr.base_dir().to_path_buf());
+
+    let res = match cli.command {
         Commands::Status => cmd_status(&config_mgr).await,
         Commands::Sync => cmd_sync(&config_mgr).await,
         Commands::Run {
@@ -161,12 +167,31 @@ async fn main() -> Result<()> {
             os_profile,
             allow_root,
         } => cmd_enroll(&config_mgr, token, os_profile, allow_root).await,
+    };
+
+    // Allow a brief window (up to 400ms) for background update task to finish saving cache if pending
+    if let Some(task) = update_task {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(400), task).await;
     }
+
+    // Display update banner if a newer version is known
+    let latest_to_notify = cached_update.or_else(|| open_cisco_zta::control::get_cached_update(config_mgr.base_dir()));
+    if let Some(latest_ver) = latest_to_notify {
+        open_cisco_zta::control::print_update_banner(&latest_ver);
+    }
+
+    res
 }
 
 async fn cmd_status(mgr: &ConfigManager) -> Result<()> {
     println!("=== Open Cisco ZTNA Client Status ===");
     println!("Config Directory: {:?}", mgr.base_dir());
+    println!("Client Version  : v{}", env!("CARGO_PKG_VERSION"));
+    if let Some(latest) = open_cisco_zta::control::get_cached_update(mgr.base_dir()) {
+        println!("Latest Version  : v{} (UPDATE AVAILABLE)", latest);
+    } else {
+        println!("Latest Version  : Up to date (or check pending)");
+    }
 
     match mgr.load_enrollment() {
         Ok(enrollment) => {
@@ -362,6 +387,31 @@ async fn cmd_run(
 
     let router = Arc::new(RouteMatcher::from_resource_configs(&ztna_config.resource_configs));
     let fake_pool = FakeIpPool::new();
+
+    if let Some(latest) = open_cisco_zta::control::get_cached_update(mgr.base_dir()) {
+        tracing::warn!(
+            "A newer release of open-cisco-zta is available: v{} -> v{}. Visit https://github.com/{}/releases/latest",
+            env!("CARGO_PKG_VERSION"),
+            latest,
+            open_cisco_zta::control::update_check::GITHUB_REPO
+        );
+    }
+
+    // Spawn periodic 24-hour update checker task for long-running daemon
+    let update_base_dir = mgr.base_dir().to_path_buf();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(24 * 3600)).await;
+            if let Some(latest) = open_cisco_zta::control::check_now(&update_base_dir).await {
+                tracing::warn!(
+                    "A new release of open-cisco-zta is available: v{} -> v{}. Visit https://github.com/{}/releases/latest",
+                    env!("CARGO_PKG_VERSION"),
+                    latest,
+                    open_cisco_zta::control::update_check::GITHUB_REPO
+                );
+            }
+        }
+    });
 
     // Spawn periodic ConfigSync background task
     let sync_interval_mins = enrollment

@@ -10,15 +10,15 @@ permissions:
 
 jobs:
   build-linux-packages:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin/
@@ -38,7 +38,7 @@ jobs:
         run: ./scripts/build-packages.sh
 
       - name: Upload Linux Artifacts
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.deb
@@ -49,7 +49,7 @@ jobs:
   build-windows-exe:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -70,6 +70,6 @@ jobs:
           Write-Output "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
 
       - name: Upload Windows Artifact
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: open-cisco-zta-*-windows-x86_64.zip

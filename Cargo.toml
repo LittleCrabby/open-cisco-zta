@@ -1,6 +1,6 @@
 [package]
 name = "open-cisco-zta"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["LittleCrabby"]
 description = "High-performance alternative client for Cisco Secure Access ZTNA"
@@ -67,6 +67,7 @@ serde_urlencoded = "0.7"
 uuid = { version = "1.10", features = ["v4"] }
 rand = "0.8"
 url = "2.5"
+semver = "1.0"
 
 hickory-proto = "0.24"
 netstack-smoltcp = "0.2.4"

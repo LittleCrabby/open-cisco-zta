@@ -76,7 +76,7 @@ impl TlsConfig {
         Self {
             cert_path: cert_path.map(|p| p.to_path_buf()),
             key_path: key_path.map(|p| p.to_path_buf()),
-            alpn_protocols: b"\x08http/1.1\x02h2".to_vec(),
+            alpn_protocols: b"\x08http/1.1".to_vec(),
         }
     }
 }
@@ -600,4 +600,18 @@ pub struct CertInfo {
     pub not_before: String,
     pub not_after: String,
     pub san_entries: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tls_config_alpn_protocols() {
+        let h1 = TlsConfig::for_http1(None, None);
+        assert_eq!(h1.alpn_protocols, b"\x08http/1.1");
+
+        let h2 = TlsConfig::for_h2(None, None);
+        assert_eq!(h2.alpn_protocols, b"\x02h2");
+    }
 }
