@@ -1,0 +1,75 @@
+name: Build & Release Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Packaging Tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+          which cargo-deb || cargo install cargo-deb --locked
+          which cargo-generate-rpm || cargo install cargo-generate-rpm --locked
+
+      - name: Build All Linux Packages (.deb, .rpm, .tar.gz)
+        run: ./scripts/build-packages.sh
+
+      - name: Upload Linux Artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+
+  build-windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Windows Executable
+        run: cargo build --release --features vendored-openssl
+
+      - name: Package Windows Zip
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches.Groups[1].Value
+          $zipName = "open-cisco-zta-v$ver-windows-x86_64.zip"
+          New-Item -ItemType Directory -Force -Path dist_win
+          Copy-Item target\release\open-cisco-zta.exe dist_win\
+          Copy-Item README.md dist_win\
+          Copy-Item LICENSE dist_win\
+          Compress-Archive -Path dist_win\* -DestinationPath $zipName
+          Write-Output "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+
+      - name: Upload Windows Artifact
+        uses: softprops/action-gh-release@v2
+        with:
+          files: open-cisco-zta-*-windows-x86_64.zip

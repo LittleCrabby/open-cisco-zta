@@ -1,0 +1,15 @@
+/target
+/dist
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+*.bin
+enrollment.json
+ztna_config.json
+machine_id
+.env
+.idea/
+.vscode/
+

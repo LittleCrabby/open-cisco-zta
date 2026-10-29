@@ -1,0 +1,82 @@
+[package]
+name = "open-cisco-zta"
+version = "0.1.0"
+edition = "2021"
+authors = ["LittleCrabby"]
+description = "High-performance alternative client for Cisco Secure Access ZTNA"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/LittleCrabby/open-cisco-zta"
+homepage = "https://github.com/LittleCrabby/open-cisco-zta"
+keywords = ["cisco", "ztna", "vpn", "proxy", "networking"]
+categories = ["command-line-utilities", "network-programming"]
+
+[package.metadata.deb]
+maintainer = "LittleCrabby"
+copyright = "2026 LittleCrabby"
+license-file = ["LICENSE", "4"]
+extended-description = """\
+High-performance standalone userspace client for Cisco Secure Access \
+Zero Trust Network Access (ZTNA) with embedded Fake-IP DNS and SOCKS5h proxy."""
+section = "net"
+priority = "optional"
+depends = "$auto, iproute2, systemd-resolved"
+assets = [
+    ["target/release/open-cisco-zta", "usr/bin/open-cisco-zta", "755"],
+    ["systemd/open-cisco-zta.service", "lib/systemd/system/open-cisco-zta.service", "644"],
+    ["README.md", "usr/share/doc/open-cisco-zta/README.md", "644"],
+    ["LICENSE", "usr/share/licenses/open-cisco-zta/LICENSE", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/open-cisco-zta", dest = "/usr/bin/open-cisco-zta", mode = "755" },
+    { source = "systemd/open-cisco-zta.service", dest = "/usr/lib/systemd/system/open-cisco-zta.service", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/open-cisco-zta/README.md", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/open-cisco-zta/LICENSE", mode = "644" },
+]
+requires = { "iproute" = "*", "systemd" = "*" }
+
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+bytes = "1"
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+
+openssl = "0.10"
+tokio-openssl = "0.6"
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+rcgen = "0.13"
+x509-parser = "0.16"
+sha2 = "0.10"
+base64 = "0.22"
+
+h2 = "0.4"
+http = "1.1"
+http-body-util = "0.1"
+ipnet = { version = "2.9", features = ["serde"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_urlencoded = "0.7"
+uuid = { version = "1.10", features = ["v4"] }
+rand = "0.8"
+url = "2.5"
+
+hickory-proto = "0.24"
+netstack-smoltcp = "0.2.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tun = { version = "0.6", features = ["async"] }
+libc = "0.2"
+foreign-types = "0.3"
+
+[features]
+default = []
+vendored-openssl = ["openssl/vendored"]

@@ -1,0 +1,36 @@
+# Maintainer: LittleCrabby
+pkgname=open-cisco-zta
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="High-performance alternative client for Cisco Secure Access ZTNA"
+arch=('x86_64')
+url="https://github.com/LittleCrabby/open-cisco-zta"
+license=('GPL3')
+depends=('iproute2' 'systemd')
+makedepends=('cargo' 'pkgconf' 'openssl')
+optdepends=(
+    'google-chrome: Automated browser SSO login'
+    'brave-bin: Alternative browser for SSO login'
+    'python: Automated cookie capture'
+    'python-websockets: Automated cookie capture via DevTools'
+)
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir/$pkgname-$pkgver"
+    cargo build --release --locked --features vendored-openssl
+}
+
+check() {
+    cd "$srcdir/$pkgname-$pkgver"
+    cargo test --release --locked
+}
+
+package() {
+    cd "$srcdir/$pkgname-$pkgver"
+    install -Dm755 "target/release/open-cisco-zta" "$pkgdir/usr/bin/open-cisco-zta"
+    install -Dm644 "systemd/open-cisco-zta.service" "$pkgdir/usr/lib/systemd/system/open-cisco-zta.service"
+    install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

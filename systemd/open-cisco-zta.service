@@ -1,0 +1,22 @@
+[Unit]
+Description=Open Cisco ZTNA Client Daemon
+Documentation=https://github.com/LittleCrabby/open-cisco-zta
+After=network-online.target systemd-resolved.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/open-cisco-zta run
+Restart=on-failure
+RestartSec=5s
+
+# Grant networking capabilities
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+
+# Logs to system journal
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
