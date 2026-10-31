@@ -6,12 +6,18 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# The daemon runs as root, so without an explicit config dir it would look in
+# /root/.config/open-cisco-zta. Point it at the enrolling user's directory with a
+# drop-in (`sudo systemctl edit open-cisco-zta`):
+#   [Service]
+#   Environment=OPEN_CISCO_ZTA_CONFIG_DIR=/home/<user>/.config/open-cisco-zta
 ExecStart=/usr/bin/open-cisco-zta run
 Restart=on-failure
 RestartSec=5s
 
-# Grant networking capabilities
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+# Grant networking capabilities. CAP_DAC_OVERRIDE lets root read and update the
+# enrollment files in the user's (typically 0700/0710) home directory.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 
 # Logs to system journal
