@@ -157,6 +157,12 @@ Packages include a systemd service template that is disabled by default. If you 
 # Enroll your machine first:
 open-cisco-zta enroll
 
+# The daemon runs as root, so tell it where your enrollment lives
+# (otherwise it looks in /root/.config/open-cisco-zta):
+sudo systemctl edit open-cisco-zta
+#   [Service]
+#   Environment=OPEN_CISCO_ZTA_CONFIG_DIR=/home/<your-user>/.config/open-cisco-zta
+
 # Start and enable daemon on boot:
 sudo systemctl enable --now open-cisco-zta
 
@@ -397,6 +403,8 @@ open-cisco-zta sync
 | `-V, --version` | Display version and git commit hash (e.g. `0.1.0 (git: abc1234)`). |
 | `-h, --help` | Display command-line help and usage instructions. |
 | `-c, --config-dir <PATH>` | Specify custom directory for configuration and certificates. |
+
+The configuration directory can also be set with the `OPEN_CISCO_ZTA_CONFIG_DIR` environment variable (used by the systemd service); `--config-dir` takes precedence.
 
 ---
 
