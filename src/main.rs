@@ -473,11 +473,11 @@ async fn cmd_run(
         }
     });
 
-    let is_linux = cfg!(target_os = "linux");
-    let effective_proxy_only = proxy_only || !is_linux;
+    let tun_supported = cfg!(any(target_os = "linux", target_os = "windows"));
+    let effective_proxy_only = proxy_only || !tun_supported;
 
-    if !is_linux && !proxy_only {
-        println!("Note: Kernel TUN interface and system routes are currently supported natively on Linux (and WSL2).");
+    if !tun_supported && !proxy_only {
+        println!("Note: Kernel TUN interface and system routes are currently supported on Linux and Windows.");
         println!("Automatically running in `--proxy-only` mode (SOCKS5h proxy).");
     }
 
@@ -512,7 +512,7 @@ async fn cmd_run(
     );
 
     tun_dev.run().await
-        .with_context(|| format!("Failed to create TUN interface '{}'. Ensure you run with 'sudo'.", tun_name))?;
+        .with_context(|| format!("Failed to create TUN interface '{}'. Ensure you run with 'sudo' (Linux) or as administrator with wintun.dll next to the executable (Windows).", tun_name))?;
 
     // Step 2: Start Fake-IP DNS servers
     // Primary on 127.0.0.1:53 for reliable systemd-resolved Split-DNS over loopback (no firewalld/rp_filter drops)
@@ -575,8 +575,13 @@ async fn cmd_run(
         }
     }
 
-    // Point systemd-resolved to 127.0.0.1 for instant, reliable resolution over loopback
-    let _ = route_mgr.configure_split_dns("127.0.0.1", &search_domains);
+    // Point systemd-resolved to 127.0.0.1 for instant, reliable resolution over loopback.
+    // Windows NRPT rules need a routable resolver address, so use the TUN IP there.
+    #[cfg(target_os = "windows")]
+    let split_dns_ip = tun_ip.to_string();
+    #[cfg(not(target_os = "windows"))]
+    let split_dns_ip = "127.0.0.1".to_string();
+    let _ = route_mgr.configure_split_dns(&split_dns_ip, &search_domains);
 
     println!("Open Cisco ZTNA All-in-One is active!");
     println!("  - Interface : {} ({})", tun_name, tun_ip);

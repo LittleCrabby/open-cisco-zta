@@ -2,21 +2,21 @@ use crate::dataplane::mux::Http2MuxTransport;
 use crate::dataplane::router::RouteMatcher;
 use crate::net::fakeip::{DnsServer, FakeIpPool};
 use anyhow::{Context, Result};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use futures::{SinkExt, StreamExt};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use netstack_smoltcp::StackBuilder;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::collections::HashMap;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::net::IpAddr;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::time::Duration;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use tokio::sync::Mutex;
 
 pub struct TunDevice {
@@ -54,7 +54,7 @@ impl TunDevice {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub async fn run(&self) -> Result<()> {
         let mut config = tun::Configuration::default();
         config
@@ -394,11 +394,11 @@ impl TunDevice {
         Ok(())
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     pub async fn run(&self) -> Result<()> {
         anyhow::bail!(
-            "Kernel TUN interface is currently supported natively on Linux (or via WSL2). \
-             On native Windows, please run with `--proxy-only` mode (SOCKS5h proxy)."
+            "Kernel TUN interface is supported on Linux and Windows. \
+             On other platforms, please run with `--proxy-only` mode (SOCKS5h proxy)."
         );
     }
 }

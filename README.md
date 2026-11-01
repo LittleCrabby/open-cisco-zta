@@ -23,17 +23,20 @@ This project is an independent, clean-room open-source implementation and is **n
      ```bash
      sudo open-cisco-zta run
      ```
-   - **Windows or unprivileged Linux (SOCKS5h proxy on `127.0.0.1:1080`):**
+   - **Windows (Transparent TUN + Split-DNS, elevated PowerShell, requires `wintun.dll` next to the executable):**
+     ```powershell
+     open-cisco-zta.exe run
+     ```
+   - **Unprivileged Windows or Linux (SOCKS5h proxy on `127.0.0.1:1080`):**
      ```bash
-     open-cisco-zta run --proxy-only   # Linux
-     open-cisco-zta.exe run            # Windows
+     open-cisco-zta run --proxy-only
      ```
 
 ---
 
 ## 🚀 Key Features
 
-- **Userspace Cross-Platform Data Plane:** Full transparent tunneling via a virtual TUN interface on Linux (`netstack-smoltcp`), or an unprivileged local SOCKS5h proxy server on Windows and Linux without kernel extensions or root privileges.
+- **Userspace Cross-Platform Data Plane:** Full transparent tunneling via a virtual TUN interface on Linux and Windows (`netstack-smoltcp`, Wintun on Windows), or an unprivileged local SOCKS5h proxy server on Windows and Linux without kernel extensions or root privileges.
 - **High-Performance HTTP/2 & MASQUE Multiplexing:** Multiplexes TCP connections (`CONNECT`) and UDP datagrams (RFC 9298 MASQUE Extended `CONNECT-UDP`) over mTLS directly to Cisco Secure Access cloud proxies.
 - **End-to-End OS Posture Spoofing:** Emulates authorized Linux or Windows client posture across all protocol stages (device registration, DHA posture, policy sync, and data plane stream headers).
 - **Embedded Fake-IP DNS Engine:** Instant local resolution of corporate domains in `198.18.0.0/15` with zero internal hostname leakage and automatic IPv6 timeout suppression.
@@ -88,6 +91,7 @@ sudo pacman -S --needed base-devel pkgconf openssl
 
 #### Runtime Requirements (Windows)
 - Windows 10 / Windows 11 (64-bit).
+- For TUN mode: Administrator rights and [`wintun.dll`](https://www.wintun.net/) (amd64) placed next to `open-cisco-zta.exe`. Not needed for `--proxy-only`.
 - Microsoft Edge, Google Chrome, or Brave for browser SSO token capture.
 - Python 3 with `websockets` (`pip install websockets`) for automated SSO cookie capture (optional; manual token entry is always available).
 
@@ -282,7 +286,7 @@ open-cisco-zta sync
 | Subcommand | Description | Recommended Privileges |
 | :--- | :--- | :--- |
 | `enroll` | Bootstrap new client enrollment, SSO authentication, and ACME certificate issuance. | Regular user (`--allow-root` for root) |
-| `run` | Run the ZTNA client daemon (TUN interface and/or local SOCKS5h proxy). | `sudo` (Linux TUN) or Regular user (`--proxy-only` / Windows) |
+| `run` | Run the ZTNA client daemon (TUN interface and/or local SOCKS5h proxy). | `sudo` / Administrator (TUN) or Regular user (`--proxy-only`) |
 | `status` | Display current enrollment, active routing rules, and certificate expiration. | Any user |
 | `sync` | Fetch updated routing rules and policies from Cisco ZTNA cloud proxy. | Any user |
 
