@@ -528,7 +528,20 @@ async fn cmd_run(
     let primary_dns_addr = SocketAddr::new(IpAddr::V4(tun_ip), 53);
     let dns_server_primary = DnsServer::new(primary_dns_addr, upstream_dns, Arc::clone(&router), fake_pool.clone());
     tokio::spawn(async move {
-        let _ = dns_server_primary.run().await;
+        // The TUN address may not be bindable right after the interface is created (Windows assigns it asynchronously)
+        let mut last_err = None;
+        for _ in 0..20 {
+            match dns_server_primary.run().await {
+                Ok(()) => return,
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            tracing::warn!("Failed to bind DNS server on {}: {:?}", primary_dns_addr, e);
+        }
     });
 
     // Also run local DNS listener on 127.0.0.1:1053 for manual test queries
