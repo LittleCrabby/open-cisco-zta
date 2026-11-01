@@ -21,38 +21,38 @@ flowchart TD
         Apps["Applications (Browser, SSH, Curl, Git, DB Tools)"]
         
         subgraph Ingress["Traffic Ingress"]
-            SOCKS["SOCKS5h Proxy Server\n(:1080)"]
-            TUN["Linux Virtual TUN Interface\n(ztna0 - netstack-smoltcp)"]
-            DNS["Embedded Fake-IP DNS Engine\n(:53 / :1053)"]
+            SOCKS["SOCKS5h Proxy Server (:1080)"]
+            TUN["Linux Virtual TUN Interface (ztna0 - netstack-smoltcp)"]
+            DNS["Embedded Fake-IP DNS Engine (:53 / :1053)"]
         end
 
         subgraph Core["open-cisco-zta Core Engine"]
-            Router["RouteMatcher\n(CIDR & FQDN Wildcards)"]
-            FakePool["Fake-IP Pool\n(198.18.0.0/15)"]
-            Mux["Http2MuxTransport\n(Connection Pool & Keepalive)"]
-            Posture["Acidex Posture Engine\n(OS Profile Spoofing)"]
+            Router["RouteMatcher (CIDR & FQDN Wildcards)"]
+            FakePool["Fake-IP Pool (198.18.0.0/15)"]
+            Mux["Http2MuxTransport (Connection Pool & Keepalive)"]
+            Posture["Acidex Posture Engine (OS Profile Spoofing)"]
         end
 
         subgraph Control["Management & Control Plane"]
-            Enroll["Enrollment Service\n(Bootstrap, DevReg, DHA)"]
-            Browser["Browser SSO Capture\n(DevTools Protocol)"]
-            ACME["Custom ACME v2 Client\n(ZtnaUriList & ztna-jwt)"]
-            Sync["ConfigSync Daemon\n(HTTP/1.1 mTLS & ETag)"]
+            Enroll["Enrollment Service (Bootstrap, DevReg, DHA)"]
+            Browser["Browser SSO Capture (DevTools Protocol)"]
+            ACME["Custom ACME v2 Client (ZtnaUriList & ztna-jwt)"]
+            Sync["ConfigSync Daemon (HTTP/1.1 mTLS & ETag)"]
             SysCheck["Pre-Flight & Safety Checks"]
         end
     end
 
     subgraph CiscoCloud["Cisco Secure Access Cloud Infrastructure"]
-        Umbrella["Cisco Umbrella API\n(enroll.ztna.sse.cisco.com)"]
-        CiscoACME["Cisco ACME CA\n(prod.acme.sse.cisco.com)"]
-        Proxy["ZTNA Cloud Proxy\n(proxy-<org>.zpc.sse.cisco.com:443)"]
+        Umbrella["Cisco Umbrella API (enroll.ztna.sse.cisco.com)"]
+        CiscoACME["Cisco ACME CA (prod.acme.sse.cisco.com)"]
+        Proxy["ZTNA Cloud Proxy (proxy-org.zpc.sse.cisco.com:443)"]
     end
 
-    Apps -->|TCP/UDP| TUN
+    Apps -->|TCP or UDP| TUN
     Apps -->|SOCKS5h| SOCKS
     Apps -->|DNS Query| DNS
 
-    DNS -->|Corporate Domain -> Fake-IP| FakePool
+    DNS -->|Corporate Domain to Fake-IP| FakePool
     DNS -.->|Public Domain| UpstreamDNS["Upstream Public DNS (1.1.1.1)"]
 
     TUN --> Router
@@ -65,7 +65,7 @@ flowchart TD
     ACME -->|mTLS Cert Issuance| CiscoACME
     Sync -->|mTLS HTTP/1.1 Sync| Proxy
 
-    Mux -->|mTLS HTTP/2 CONNECT (TCP)\nCONNECT-UDP MASQUE (UDP)\n+ x-acidex-* Headers| Proxy
+    Mux -->|mTLS HTTP/2 CONNECT and MASQUE UDP| Proxy
 ```
 
 ---
