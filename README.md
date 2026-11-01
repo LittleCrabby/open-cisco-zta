@@ -33,39 +33,14 @@ This project is an independent, clean-room open-source implementation and is **n
 
 ## 🚀 Key Features
 
-- **Cross-Platform Userspace Data Plane:**
-  - **Linux:** Creates a virtual TUN interface (`ztna0`) backed by a userspace TCP/IP stack (`netstack-smoltcp`).
-  - **Windows & Linux (Unprivileged):** Full-featured local SOCKS5h proxy server (`socks5h://127.0.0.1:1080`), allowing selective or system-wide tunneling without administrator/root privileges or kernel drivers.
-  - Multiplexes TCP and UDP connections over mTLS HTTP/2 transport (`h2` over `tokio-openssl`) connected directly to Cisco Secure Access cloud proxies (`proxy-<org_id>.zpc.sse.cisco.com:443`).
-  - Utilizes HTTP/2 `CONNECT` (TCP) and Extended `CONNECT-UDP` (RFC 8441 / RFC 9298 MASQUE with RFC 9297 `DATAGRAM` capsules for UDP protocols like Kerberos KDC port 88), proactive keepalive pinging (every 30s), dynamic flow-control capacity management (`WINDOW_UPDATE`), and flow posture injection (`x-acidex-*`).
-- **OS Posture Spoofing (`--os-profile` / `--spoof-os`):**
-  - Spoof client posture when connecting from Windows to appear as an authorized Linux client (`Ubuntu 22.04 LTS`, `linux-x86_64`), or vice versa.
-  - Seamlessly injected across all protocol layers: Device Registration, DHA Posture Exchange (`acidex`), ConfigSync, and HTTP/2 stream headers.
-- **Embedded Fake-IP DNS Engine (`198.18.0.0/15`):**
-  - Resolves internal corporate domains (`*.corp.lan`, `*.internal.net`) into synthetic IPv4 addresses in the `198.18.0.0/15` range instantly.
-  - Automatically synthesizes empty `NOERROR` responses for `AAAA` records to eliminate IPv6 timeout latency.
-- **Rule Matching & Routing (`RouteMatcher`):**
-  - Dynamically evaluates corporate CIDR subnets and FQDN rules with wildcard support (`*.internal.company.com`) and exclusion handling (`*.sse.cisco.com`).
-- **Split-DNS & System Route Management (Linux):**
-  - Automatically configures `systemd-resolved` Split-DNS routing domains and kernel routing tables.
-  - Gracefully restores all routing states on `SIGINT` or `SIGTERM`.
-- **Standalone Enrollment & ACME Certificate Lifecycle:**
-  - Multi-stage enrollment:
-    1. **Bootstrap Initialization** with RFC 9449 DPoP JWT (ES256).
-    2. **Browser SSO Authentication** with automated SSO token capture via DevTools Protocol (Edge/Chrome/Brave) or manual fallback.
-    3. **Device Registration** with Cisco Umbrella API.
-    4. **DHA Posture Registration** with hardware posture (`acidex`) exchange.
-    5. **ACME v2 Certificate Issuance** (RFC 8555 + Cisco custom `ZtnaUriList`) to generate client P-256 keys and obtain an official intermediate CA-signed client certificate.
-- **Dynamic Policy Synchronization (`ConfigSync`):**
-  - Automatically syncs routing policies from `/.well-known/zta-config/cisco/v2` with HTTP ETag caching and 304 Not Modified validation.
-- **Automated Pre-Flight & Safety Checks:**
-  - Prevents desktop browser session corruption and permission issues by disallowing accidental `sudo enroll` (`--allow-root` override available).
-  - Validates privileges on Linux for TUN interface creation, prompting clear instructions for `sudo` or unprivileged `--proxy-only`.
-  - Discovers active official Cisco Secure Client background daemons (`csc_zta_agent`, `acsockd`, `vpnagentd`) and prevents interface collisions (`-f` / `--force` override available).
-- **Non-Blocking Update Notifications:**
-  - Automatically notifies users on `stderr` when a new release is published on GitHub, without adding latency or blocking CLI command execution.
-  - Employs a 24-hour local disk cache (`.update_cache.json`), GitHub redirect inspection to bypass API rate limits, and SemVer version comparison.
-  - Can be disabled at any time via the `OPEN_CISCO_ZTA_NO_UPDATE_CHECK=1` or `CI=1` environment variables.
+- **Userspace Cross-Platform Data Plane:** Full transparent tunneling via a virtual TUN interface on Linux (`netstack-smoltcp`), or an unprivileged local SOCKS5h proxy server on Windows and Linux without kernel extensions or root privileges.
+- **High-Performance HTTP/2 & MASQUE Multiplexing:** Multiplexes TCP connections (`CONNECT`) and UDP datagrams (RFC 9298 MASQUE Extended `CONNECT-UDP`) over mTLS directly to Cisco Secure Access cloud proxies.
+- **End-to-End OS Posture Spoofing:** Emulates authorized Linux or Windows client posture across all protocol stages (device registration, DHA posture, policy sync, and data plane stream headers).
+- **Embedded Fake-IP DNS Engine:** Instant local resolution of corporate domains in `198.18.0.0/15` with zero internal hostname leakage and automatic IPv6 timeout suppression.
+- **Automated Lifecycle & Dynamic Sync:** Effortless browser SSO authentication, custom ACME v2 certificate issuance, and dynamic policy synchronization with ETag caching.
+- **Non-Blocking Update Checker:** Background release inspection that alerts users to newer versions without slowing down CLI execution.
+
+> 📖 **Documentation:** For in-depth technical specifications, component deep-dives, and protocol invariants, see the [Full Features Documentation](docs/features.md) and [System Architecture](docs/architecture.md).
 
 ---
 
@@ -233,19 +208,9 @@ open-cisco-zta enroll --os-profile linux
 open-cisco-zta enroll --os-profile windows
 ```
 
-> [!TIP]
-> `--spoof-os <profile>` is available as an alias for `--os-profile <profile>`.
+*(If you already have an SSO JWT token, pass it directly: `open-cisco-zta enroll --token <jwt>`)*.
 
-**Enrollment Flow:**
-1. Connects to Cisco Secure Access bootstrap endpoint using an ephemeral RFC 9449 DPoP key.
-2. Automatically launches your default Chromium-based browser (Edge, Chrome, Brave) to the corporate SSO login portal.
-3. Automatically captures the authenticated `elb-sso-jwt` cookie via Chrome DevTools Protocol.
-4. Performs Device Registration and DHA Posture Registration (`acidex`).
-5. Generates a local P-256 private key and CSR.
-6. Connects to Cisco ACME CA, answers the `ztna-jwt` challenge, and retrieves the signed client mTLS certificate chain.
-7. Saves all credentials and downloads initial routing policies to the configuration directory.
-
-*(If you already have an SSO JWT token, pass it directly: `open-cisco-zta enroll --token <jwt>`)*
+> 📖 **Enrollment Details:** For the complete step-by-step lifecycle breakdown (DPoP, browser DevTools cookie interception, DHA posture exchange, and ACME challenge resolution), see [Client Enrollment & Authentication](docs/enrollment.md).
 
 ---
 
@@ -286,24 +251,6 @@ On Linux, full kernel TUN interface and automatic `systemd-resolved` Split-DNS p
 sudo open-cisco-zta run
 ```
 
-> [!TIP]
-> **Built-in Pre-Flight Safety Checks:**
-> When executing `run`, the client automatically performs pre-flight validation:
-> 1. **Privilege Verification:** If run without `sudo` when TUN mode is requested, it provides clear guidance to run `sudo open-cisco-zta run` or switch to unprivileged proxy mode `open-cisco-zta run --proxy-only`.
-> 2. **Cisco Daemon Conflict Detection:** It automatically checks if the official Cisco Secure Client daemons (`csc_zta_agent`, `acsockd`, `vpnagentd`) are running. If detected, it warns you to stop them (`sudo systemctl stop csc_zta_agent acsockd`). To bypass this check if you know what you are doing, pass `-f` / `--force`:
->    ```bash
->    sudo open-cisco-zta run --force
->    ```
-
-**Output:**
-```text
-Open Cisco ZTNA All-in-One is active!
-  - Interface : ztna0 (100.64.0.1)
-  - DNS       : 100.64.0.1:53 (UDP/TCP) -> Split-DNS for ["corp.example.com", "internal.lan"]
-  - SOCKS5h   : socks5h://127.0.0.1:1080
-Press Ctrl+C to stop.
-```
-
 All corporate traffic is transparently tunneled. Pressing `Ctrl+C` cleans up routing and restores original network state.
 
 ---
@@ -314,35 +261,6 @@ Inspect active enrollment details, downloaded routing rules, and certificate val
 
 ```bash
 open-cisco-zta status
-```
-
-**Example Output:**
-```text
-=== Open Cisco ZTNA Client Status ===
-Config Directory: "/home/user/.config/open-cisco-zta"
-
-[Enrollment Information]
-  Organization ID : 8354922
-  User ID         : user@example.com
-  ZTNA Device ID  : 1000000028bdab15
-  Config Sync URL : https://proxy-8354922.zpc.sse.cisco.com/.well-known/zta-config/cisco/v2
-  Sync Interval   : 10 min
-  OS Profile      : linux
-
-[Routing Policies]
-  CIDR Include Subnets : 39
-  FQDN Include Rules   : 216
-  FQDN Exclude Rules   : 1
-
-[Client Certificate]
-  Certificate Path: "/home/user/.config/open-cisco-zta/client_cert.pem"
-  Issuer    : organizationName=Cisco, commonName=PROD Internal ZTNA Sub CA 1 pca
-  Valid From: Oct 28 20:47:07 2026 GMT
-  Valid To  : Dec  2 20:47:07 2026 GMT
-  SAN URIs  :
-    - urn:cisco:sse:orgid:8354922
-    - urn:cisco:sse:userid:user@example.com
-    - urn:cisco:sse:ztna:deviceid:1000000028bdab15
 ```
 
 ---
@@ -368,99 +286,9 @@ open-cisco-zta sync
 | `status` | Display current enrollment, active routing rules, and certificate expiration. | Any user |
 | `sync` | Fetch updated routing rules and policies from Cisco ZTNA cloud proxy. | Any user |
 
-### Subcommand Options & Flags
+> 📖 **Full CLI Reference:** For comprehensive option tables, default parameters, environment variables, and usage examples for every command, see the [CLI Reference](docs/cli-reference.md).
 
-#### `open-cisco-zta enroll`
-| Flag / Option | Default | Description |
-| :--- | :--- | :--- |
-| `--token <JWT>` | *None* | Pass corporate SSO JWT token directly to bypass browser automation. |
-| `--os-profile <PROFILE>`<br>*(alias: `--spoof-os`)* | `auto` | OS posture spoofing profile (`auto`, `linux`, `windows`). |
-| `--allow-root` | `false` | Allow running enrollment as root/sudo (normally blocked to protect user browser SSO). |
-| `-c, --config-dir <PATH>` | `~/.config/open-cisco-zta` | Custom configuration directory path. |
-
-#### `open-cisco-zta run`
-| Flag / Option | Default | Description |
-| :--- | :--- | :--- |
-| `--proxy-only` | `false` | Run in userspace SOCKS5h proxy mode only (no TUN interface, no root needed). |
-| `-f, --force` | `false` | Force start even if conflicting official Cisco daemons are detected. |
-| `--os-profile <PROFILE>`<br>*(alias: `--spoof-os`)* | Enrollment profile | Override client OS posture profile (`auto`, `linux`, `windows`). |
-| `--socks-addr <IP:PORT>` | `127.0.0.1:1080` | Local SOCKS5h proxy listen address. |
-| `--dns-addr <IP:PORT>` | `127.0.0.1:1053` | Embedded Fake-IP DNS server listen address. |
-| `--upstream-dns <IP:PORT>` | `1.1.1.1:53` | Upstream DNS resolver for non-corporate public domains. |
-| `--tun-name <NAME>` | `ztna0` | Virtual TUN interface name (Linux). |
-| `--tun-ip <IPV4>` | `100.64.0.1` | Local IP address assigned to TUN interface (Linux). |
-| `-c, --config-dir <PATH>` | `~/.config/open-cisco-zta` | Custom configuration directory path. |
-
-#### Global Options
-| Flag | Description |
-| :--- | :--- |
-| `-V, --version` | Display version and git commit hash (e.g. `0.1.0 (git: abc1234)`). |
-| `-h, --help` | Display command-line help and usage instructions. |
-| `-c, --config-dir <PATH>` | Specify custom directory for configuration and certificates. |
-
----
-
-## 📁 Configuration Directory
-
-All credentials, private keys, certificates, and cached routing tables are saved in:
-- **Linux:** `~/.config/open-cisco-zta/`
-- **Windows:** `%APPDATA%\open-cisco-zta\` (e.g. `C:\Users\<User>\AppData\Roaming\open-cisco-zta\`)
-
-```text
-open-cisco-zta/
-├── enrollment.json        # Organization ID, Device ID, OS profile, and sync metadata
-├── ztna_config.json       # Cached resource routing rules (CIDR / FQDN lists)
-├── client_cert.pem        # Signed mTLS client certificate chain
-├── client_key.pem         # Client EC P-256 private key
-├── machine_id             # Persistent hardware UDID for posture stability
-└── .update_cache.json     # Cached latest release version and check timestamp
-```
-
----
-
-## 🏗️ Project Architecture
-
-```text
-open-cisco-zta/
-├── .github/workflows/       # GitHub Actions automated release pipeline
-├── Cargo.toml               # Package definition, cargo-deb & cargo-generate-rpm metadata
-├── LICENSE                  # GNU General Public License v3.0
-├── packaging/
-│   └── arch/PKGBUILD        # Arch Linux PKGBUILD packaging
-├── scripts/
-│   ├── build-packages.sh    # Local build script for .deb, .rpm, .tar.gz
-│   └── release.sh           # SemVer release helper & git tagger
-├── systemd/
-│   └── open-cisco-zta.service # Systemd daemon service unit template
-├── VERSIONING.md            # Semantic versioning & release guide
-├── README.md
-└── src/
-    ├── main.rs              # CLI entry point (`enroll`, `run`, `status`, `sync`)
-    ├── lib.rs               # Library root and exports
-    ├── config/              # State persistence and Serde schemas
-    │   ├── mod.rs           # ConfigManager (cross-platform path resolution)
-    │   └── schema.rs        # EnrollmentState, ZtnaConfig, ResourceConfig
-    ├── control/             # Management plane
-    │   ├── browser.rs       # Automated DevTools SSO token capture (Edge/Chrome/Brave)
-    │   ├── enroll.rs        # Bootstrap, device registration, and DHA posture registration
-    │   ├── sync.rs          # Dynamic config synchronization with ETag caching
-    │   ├── system_check.rs  # Pre-flight privilege checks & Cisco daemon conflict detection
-    │   └── update_check.rs  # Non-blocking GitHub release update notifier & caching
-    ├── crypto/              # Cryptographic operations
-    │   ├── acme.rs          # RFC 8555 ACME client for Cisco custom ZtnaUriList
-    │   ├── dpop.rs          # RFC 9449 DPoP proof signer (ES256)
-    │   └── mod.rs           # OpenSSL mTLS connector and X.509 inspector
-    ├── dataplane/           # Data plane tunneling and routing
-    │   ├── mux.rs           # Http2MuxTransport (h2 connection pool & CONNECT stream tunnels)
-    │   ├── router.rs        # Fast CIDR and wildcard domain matching
-    │   └── socks5.rs        # Local SOCKS5h proxy server
-    ├── net/                 # Networking layer
-    │   ├── fakeip.rs        # Fake-IP pool (198.18.0.0/15) & micro-DNS server
-    │   ├── sys_route.rs     # systemd-resolved and kernel route manager (Linux)
-    │   └── tun_device.rs    # Virtual TUN interface & netstack-smoltcp bridge
-    └── plugins/             # Posture and metadata plugins
-        └── acidex.rs        # Device posture collector & OS Profile spoofing
-```
+> 📁 **Configuration & Architecture:** For details on configuration file formats, state schemas, and system internals, refer to [Configuration & State Persistence](docs/configuration.md) and [System Architecture](docs/architecture.md).
 
 ---
 
@@ -482,7 +310,6 @@ To set clear expectations, here is what `open-cisco-zta` explicitly **does NOT**
 | **ThousandEyes Endpoint Agent** | Conducts automated synthetic network path tests, VoIP metric collection, and browser session monitoring. | **No synthetic monitoring.** No synthetic network probes or browser agents are bundled. |
 | **Cisco Cloud Management (CCM) & Auto-Updates** | Connects to central Cisco cloud management for remote administrator policy pushes, silent background binary updates, and remote configuration locks. | **No remote management or silent auto-updates.** Completely under local user control. Binaries must be updated manually; a non-blocking notification banner is shown when a newer release is published. |
 | **Desktop GUI / System Tray Applet** | Provides Qt-based desktop UI (`vpnui`), tray icons, popups, and graphical status graphs. | **Headless / CLI only.** Designed as a lean CLI daemon for servers, containers, developers, and terminal environments. |
-| **Raw UDP Tunneling over ZTNA** | Some enterprise private applications require raw UDP datagram forwarding. | **TCP-only tunneling.** Cisco Secure Access ZTNA tunnels private application traffic over HTTP/2 `CONNECT` streams. We tunnel all TCP-based corporate applications (SSH, HTTP/HTTPS, databases, Git, Kubernetes, remote desktops); raw UDP outside DNS is not tunneled. |
 
 ---
 

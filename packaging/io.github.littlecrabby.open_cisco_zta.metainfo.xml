@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="console-application">
+  <id>io.github.littlecrabby.open_cisco_zta</id>
+  <name>open-cisco-zta</name>
+  <summary>High-performance alternative client for Cisco Secure Access ZTNA</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.littlecrabby">
+    <name>LittleCrabby</name>
+  </developer>
+  <description>
+    <p>
+      open-cisco-zta is an open-source, high-performance standalone client for Cisco Secure Access Zero Trust Network Access (ZTNA).
+      It provides split-tunnel routing, embedded Fake-IP DNS, and HTTP/2 multiplexing for secure corporate network access.
+    </p>
+  </description>
+  <url type="homepage">https://github.com/LittleCrabby/open-cisco-zta</url>
+  <url type="bugtracker">https://github.com/LittleCrabby/open-cisco-zta/issues</url>
+  <provides>
+    <binary>open-cisco-zta</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+</component>

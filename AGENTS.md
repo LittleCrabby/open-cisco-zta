@@ -61,6 +61,7 @@ Several components interact with Cisco Secure Access cloud endpoints (`*.ztna.ss
 
 ---
 
-## 4. Documentation Maintenance (`README.md`)
+## 4. Documentation Maintenance (`README.md` & `docs/`)
 
-- **Always check `README.md` after making changes:** Whenever you add, modify, or remove CLI commands/flags, configuration files, environment variables, supported OS profiles, architectural modules, or build/runtime dependencies, inspect `README.md` and update it in the same change so user documentation remains accurate and in sync with the codebase.
+- **Primary Project Documentation (`docs/`):** Detailed architectural breakdowns, technical principles, exhaustive CLI flags/options references, configuration schemas, and protocol lifecycles are maintained inside the `docs/` directory. Whenever you implement changes, additions, or modifications, you **must evaluate and update the relevant primary documentation in `docs/`** (`docs/architecture.md`, `docs/cli-reference.md`, `docs/configuration.md`, `docs/features.md`, `docs/enrollment.md`) to keep it accurate and in sync with the codebase.
+- **Selective `README.md` Updates:** `README.md` is intentionally lean and focused on quick onboarding and high-level project boundaries. **Only update `README.md` if your changes directly affect the core, high-level aspects already presented in `README.md`** (such as the high-level subcommands summary table, Quick Start commands, prerequisites/build tools, or the Non-Goals table). Detailed options/flags, configuration schemas, and deep architectural mechanisms belong exclusively in `docs/` and must not bloat `README.md`.

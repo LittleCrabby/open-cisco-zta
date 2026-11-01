@@ -24,14 +24,17 @@ depends = "$auto, iproute2, systemd-resolved"
 assets = [
     ["target/release/open-cisco-zta", "usr/bin/open-cisco-zta", "755"],
     ["systemd/open-cisco-zta.service", "lib/systemd/system/open-cisco-zta.service", "644"],
+    ["packaging/io.github.littlecrabby.open_cisco_zta.metainfo.xml", "usr/share/metainfo/io.github.littlecrabby.open_cisco_zta.metainfo.xml", "644"],
     ["README.md", "usr/share/doc/open-cisco-zta/README.md", "644"],
     ["LICENSE", "usr/share/licenses/open-cisco-zta/LICENSE", "644"],
 ]
 
 [package.metadata.generate-rpm]
+vendor = "LittleCrabby"
 assets = [
     { source = "target/release/open-cisco-zta", dest = "/usr/bin/open-cisco-zta", mode = "755" },
     { source = "systemd/open-cisco-zta.service", dest = "/usr/lib/systemd/system/open-cisco-zta.service", mode = "644" },
+    { source = "packaging/io.github.littlecrabby.open_cisco_zta.metainfo.xml", dest = "/usr/share/metainfo/io.github.littlecrabby.open_cisco_zta.metainfo.xml", mode = "644" },
     { source = "README.md", dest = "/usr/share/doc/open-cisco-zta/README.md", mode = "644" },
     { source = "LICENSE", dest = "/usr/share/licenses/open-cisco-zta/LICENSE", mode = "644" },
 ]
