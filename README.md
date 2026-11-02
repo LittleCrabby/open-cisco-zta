@@ -228,13 +228,13 @@ open-cisco-zta enroll --os-profile windows
 
 #### Option A: Native Windows & Linux Unprivileged Mode (SOCKS5h)
 
-On Windows, or on Linux without `sudo` privileges:
+On Windows or Linux without root/Administrator privileges:
 ```bash
 # On Linux (non-root):
 open-cisco-zta run --proxy-only
 
-# On Windows:
-open-cisco-zta.exe run
+# On Windows (non-elevated):
+open-cisco-zta.exe run --proxy-only
 ```
 
 This starts the high-performance local SOCKS5h proxy server on `socks5h://127.0.0.1:1080` (and Fake-IP DNS resolver on `127.0.0.1:1053`).
@@ -253,12 +253,18 @@ This starts the high-performance local SOCKS5h proxy server on `socks5h://127.0.
       ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p
   ```
 
-#### Option B: Linux Full System Mode (Virtual TUN + Split-DNS)
+#### Option B: Linux & Windows Full System Mode (Virtual TUN + Split-DNS)
 
-On Linux, full kernel TUN interface and automatic `systemd-resolved` Split-DNS provide transparent corporate access across your entire operating system without per-application proxy configuration:
+On Linux (via kernel TUN + `systemd-resolved`) and Windows (via Wintun + `netsh` + NRPT Split-DNS), full-system mode provides transparent corporate access across your entire operating system without per-application proxy configuration:
 
 ```bash
+# On Linux (requires root / sudo):
 sudo open-cisco-zta run
+```
+
+```powershell
+# On Windows (elevated PowerShell, requires wintun.dll next to open-cisco-zta.exe):
+open-cisco-zta.exe run
 ```
 
 All corporate traffic is transparently tunneled. Pressing `Ctrl+C` cleans up routing and restores original network state.

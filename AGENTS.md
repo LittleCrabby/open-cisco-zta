@@ -28,7 +28,7 @@ Several components interact with Cisco Secure Access cloud endpoints (`*.ztna.ss
 
 ---
 
-## 2. Networking Stack, Fake-IP DNS & `systemd-resolved`
+## 2. Networking Stack, Fake-IP DNS & OS Split-DNS
 
 - **Strict Isolation of Corporate DNS Queries (`src/net/fakeip.rs`):**
   - When `RouteMatcher::matches_domain` identifies a domain as corporate:
@@ -36,19 +36,21 @@ Several components interact with Cisco Secure Access cloud endpoints (`*.ztna.ss
     - **All other query types (`AAAA`, `HTTPS` type 65, `TXT`, etc.) must immediately return an empty `NOERROR` (NODATA) response.**
     - **Never** forward corporate domain queries to the upstream public DNS resolver; doing so leaks internal hostnames and causes IPv6 connection timeout delays.
   - **EDNS0 Mirroring:** Always mirror the request's EDNS0 extensions (`set_dnssec_ok(false)`) in DNS responses so `systemd-resolved` does not downgrade or reject packets.
-- **Linux TUN & Split-DNS Routing (`src/main.rs`, `src/net/tun_device.rs`, `src/net/sys_route.rs`):**
-  - In Linux full-system mode, the TUN device (`ztna0` by default) must be brought up before binding the TUN-address DNS listener.
-  - DNS listeners run on `127.0.0.1:53` (used as the target for `resolvectl dns <tun> 127.0.0.1` to avoid `rp_filter` / `firewalld` drops), on `<tun_ip>:53`, and inside the userspace `netstack-smoltcp` UDP/TCP port 53 handlers.
-  - `SystemRouteManager::apply_routes` always routes `198.18.0.0/15` plus all policy CIDR subnets through the TUN device, adds the TUN interface to the `firewalld` `trusted` zone (if active), and cleans up routes/interfaces on shutdown (`SIGINT` / `SIGTERM`).
-  - Redundant subdomains are pruned before passing `~<domain>` routing domains to `resolvectl domain` to keep `systemd-resolved` routing tables compact.
+- **Linux & Windows TUN & Split-DNS Routing (`src/main.rs`, `src/net/tun_device.rs`, `src/net/sys_route.rs`):**
+  - In full-system mode (Linux kernel TUN or Windows Wintun), the TUN device (`ztna0` by default) must be brought up before binding the TUN-address DNS listener.
+  - Because Windows Wintun assigns the interface IPv4 address asynchronously, binding the DNS listener on `<tun_ip>:53` in `src/main.rs` retries up to 20 times (500 ms intervals) before configuring routes and Split-DNS.
+  - DNS listeners run on `127.0.0.1:53` (used as the target for `resolvectl dns <tun> 127.0.0.1` on Linux to avoid `rp_filter` / `firewalld` drops), on `<tun_ip>:53` (used as the target for Windows NRPT rules since NRPT requires a routable address), and inside the userspace `netstack-smoltcp` UDP/TCP port 53 handlers.
+  - **Linux (`SystemRouteManager`):** Routes `198.18.0.0/15` plus all policy CIDR subnets through the TUN device via `ip route`, adds the TUN interface to the `firewalld` `trusted` zone (if active), prunes redundant subdomains before passing `~<domain>` routing domains to `resolvectl domain`, and cleans up routes/interfaces on shutdown (`SIGINT` / `SIGTERM`).
+  - **Windows (`SystemRouteManager`):** Routes `198.18.0.0/15` plus policy IPv4 CIDRs via `netsh interface ipv4 add route ... store=active`, configures NRPT Split-DNS via `Add-DnsClientNrptRule` (tagged with `Comment = "open-cisco-zta"`) with both suffix (`'.domain'`) and exact (`'domain'`) namespaces pointing to `<tun_ip>`, flushes the DNS client cache (`Clear-DnsClientCache`), and removes NRPT rules and routes on startup (stale recovery) and shutdown.
 
 ---
 
 ## 3. Cross-Platform Support, Privilege Model & Posture Spoofing
 
-- **Linux vs. Windows Conditional Compilation (`Cargo.toml`, `src/net/`, `src/control/system_check.rs`):**
-  - `tun` and `libc` are Linux-only dependencies (`[target.'cfg(target_os = "linux")'.dependencies]`).
-  - Any code touching kernel TUN devices, `ip` / `resolvectl` / `firewall-cmd`, `libc::geteuid()`, or `/proc` must be gated behind `#[cfg(target_os = "linux")]` with appropriate non-Linux fallbacks (`#[cfg(not(target_os = "linux"))]`) so native Windows builds (`--proxy-only` SOCKS5h mode) compile cleanly.
+- **Linux vs. Windows Conditional Compilation (`Cargo.toml`, `src/net/`, `src/control/system_check.rs`, `src/crypto/mod.rs`):**
+  - `tun` (`[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]`) is shared across Linux and Windows; `libc` and `foreign-types` are Linux-only (`[target.'cfg(target_os = "linux")'.dependencies]`); `schannel` is Windows-only (`[target.'cfg(target_os = "windows")'.dependencies]`, used by `load_windows_root_certs` to populate OpenSSL's trust store from the Windows `ROOT` certificate stores).
+  - Code in `src/net/tun_device.rs` and `src/net/sys_route.rs` is gated behind `#[cfg(any(target_os = "linux", target_os = "windows"))]` with OS-specific branches (`#[cfg(target_os = "linux")]` for `ip`/`resolvectl`/`firewall-cmd`, `#[cfg(target_os = "windows")]` for `netsh`/PowerShell NRPT) and non-Linux/Windows fallbacks (`#[cfg(not(any(target_os = "linux", target_os = "windows")))]`).
+  - Linux-specific privilege/system checks (`libc::geteuid()`, `/proc`, TPM2 PKCS#11) must remain gated behind `#[cfg(target_os = "linux")]`, while Windows TUN privilege checks verify elevated Administrator (`S-1-16-12288`) or SYSTEM (`S-1-16-16384`) mandatory level SIDs via `whoami /groups`.
 - **Privilege Separation & Configuration Path Resolution (`src/config/mod.rs`, `src/control/system_check.rs`):**
   - **`enroll` runs unprivileged:** `check_enroll_privileges` blocks running `enroll` under `root`/`sudo` (unless `--allow-root` is passed) because desktop browsers fail to launch or capture SSO cookies under root, and config files would become root-owned.
   - **`run` under `sudo` resolves the real user's config:** When `sudo open-cisco-zta run` is executed on Linux, `ConfigManager::default_dir()` inspects `SUDO_USER` so that `/home/<SUDO_USER>/.config/open-cisco-zta` is used instead of `/root/.config/open-cisco-zta`. Preserve this behavior when modifying path resolution.

@@ -72,14 +72,17 @@ Traditional DNS queries for internal enterprise domains often fail or leak when 
 
 ---
 
-### 5. Automated System Route & Split-DNS Management (Linux)
+### 5. Automated System Route & Split-DNS Management (Linux & Windows)
 
-- **Kernel Routing:** Automatically binds routes for `198.18.0.0/15` and all policy-defined corporate CIDRs through the TUN interface.
-- **`systemd-resolved` Split-DNS:**
+- **System Routing:** Automatically binds routes for `198.18.0.0/15` and all policy-defined corporate CIDRs through the TUN interface (`ip route` on Linux, `netsh interface ipv4 add route` on Windows).
+- **Linux `systemd-resolved` Split-DNS:**
   - Registers the TUN interface with `systemd-resolved` via `resolvectl dns`.
   - Configures routing domains (`~<domain>`) so only relevant internal corporate queries are dispatched to the client's internal DNS resolver.
   - Automatically deduplicates and prunes redundant subdomains to keep routing tables clean.
-- **Firewall Integration:** Detects active `firewalld` daemons and automatically enrolls the TUN interface in the `trusted` zone.
+- **Linux Firewall Integration:** Detects active `firewalld` daemons and automatically enrolls the TUN interface in the `trusted` zone.
+- **Windows NRPT Split-DNS:**
+  - Configures Windows Name Resolution Policy Table (NRPT) rules via `Add-DnsClientNrptRule` (tagged with comment `open-cisco-zta`) for both suffix (`'.domain'`) and exact (`'domain'`) namespaces pointing to the TUN IP, and flushes the Windows DNS cache (`Clear-DnsClientCache`).
+  - Automatically cleans up NRPT rules and routes on shutdown (and removes any leftover rules on startup).
 
 ---
 
@@ -105,7 +108,7 @@ Traditional DNS queries for internal enterprise domains often fail or leak when 
 ### 8. Built-in Safety & Conflict Checks
 
 - **Sudo Enrollment Guard:** Disallows accidentally running `open-cisco-zta enroll` under `sudo` to protect against browser session permission corruption and root-owned config directories (`--allow-root` override available for headless environments).
-- **TUN Privilege Verification:** Ensures proper privileges are present before attempting kernel TUN creation, suggesting `sudo` or `--proxy-only`.
+- **TUN Privilege Verification:** Ensures proper privileges are present before attempting virtual TUN creation (root / `CAP_NET_ADMIN` on Linux, or elevated Administrator / SYSTEM mandatory level SID `S-1-16-12288` / `S-1-16-16384` on Windows), suggesting `sudo` / elevated PowerShell or `--proxy-only`.
 - **Cisco Agent Conflict Detection:** Checks if official Cisco Secure Client daemons (`csc_zta_agent`, `acsockd`, `vpnagentd`) are actively running and warns the user to avoid network conflicts (`-f` / `--force` override available).
 
 ---

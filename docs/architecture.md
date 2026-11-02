@@ -10,7 +10,7 @@ This document provides a comprehensive deep-dive into the internal architecture,
 
 1. **Control Plane (`src/control/`)**: Handles authentication, browser SSO cookie interception, device and DHA posture registration, dynamic policy synchronization, and safety pre-flight validations.
 2. **Cryptographic Subsystem (`src/crypto/`)**: Implements RFC 9449 DPoP JWT proofs, RFC 8555 custom ACME v2 certificate issuance, and OpenSSL mTLS engine.
-3. **Networking & DNS Engine (`src/net/`)**: Manages the Linux kernel TUN interface, userspace TCP/IP stack (`netstack-smoltcp`), synthetic Fake-IP pool (`198.18.0.0/15`), micro-DNS server, and `systemd-resolved` Split-DNS integration.
+3. **Networking & DNS Engine (`src/net/`)**: Manages the virtual TUN interface (Linux kernel TUN / Windows Wintun), userspace TCP/IP stack (`netstack-smoltcp`), synthetic Fake-IP pool (`198.18.0.0/15`), micro-DNS server, and OS Split-DNS integration (`systemd-resolved` on Linux, NRPT on Windows).
 4. **Data Plane & Multiplexing (`src/dataplane/`)**: Establishes mTLS HTTP/2 transport to Cisco cloud proxies, multiplexing application TCP connections (`CONNECT`) and UDP datagrams (`CONNECT-UDP` MASQUE), as well as serving a local SOCKS5h proxy.
 5. **Posture & Plugin System (`src/plugins/`)**: Synthesizes and injects device posture (`AcidexPayload`), allowing OS profile spoofing across all stages.
 6. **Configuration & State Management (`src/config/`)**: Manages cross-platform persistent storage, real-user resolution under `sudo`, and serialized state schemas.
@@ -22,7 +22,7 @@ flowchart TD
         
         subgraph Ingress["Traffic Ingress"]
             SOCKS["SOCKS5h Proxy Server (:1080)"]
-            TUN["Linux Virtual TUN Interface (ztna0 - netstack-smoltcp)"]
+            TUN["Virtual TUN Interface (ztna0 - Linux TUN / Windows Wintun + netstack-smoltcp)"]
             DNS["Embedded Fake-IP DNS Engine (:53 / :1053)"]
         end
 
@@ -183,6 +183,7 @@ Cisco uses an RFC 8555 ACME server with proprietary zero-trust extensions:
 - Negotiates ALPN based on caller requirements:
   - Data Plane: ALPN `h2`.
   - ConfigSync: ALPN `http/1.1`.
+- On Windows (where statically linked `vendored-openssl` has no default trust store), loads trusted root certificates from the Windows system certificate stores (`ROOT` for `CurrentUser` and `LocalMachine` via `schannel`).
 - Automatically loads client certificate chains and P-256 private keys from the configuration directory.
 - Inspects client certificates to verify expiration dates, issuer CAs, and Subject Alternative Names (`SAN URIs`).
 
@@ -202,27 +203,37 @@ The Fake-IP engine allows transparent interception of corporate domain traffic w
 - **EDNS0 Mirroring:** Request EDNS0 extensions are mirrored in DNS responses (`set_dnssec_ok(false)`) to ensure strict compatibility with `systemd-resolved`.
 - **Dual Transport:** Embedded DNS listens simultaneously on UDP and TCP.
 
-### 3.2 Linux Virtual TUN & Userspace Network Stack (`tun_device.rs`)
+### 3.2 Virtual TUN & Userspace Network Stack (`tun_device.rs`)
 
-When running with full system privileges on Linux:
-- Creates a virtual TUN device (`ztna0`, IP `100.64.0.1/32`, MTU 1500).
+When running with full system privileges on Linux (root / `CAP_NET_ADMIN`) or Windows (Administrator / SYSTEM with `wintun.dll` next to the executable):
+- Creates a virtual TUN device (`ztna0`, IP `100.64.0.1/32`, MTU 1500), backed by the kernel TUN driver on Linux or Wintun on Windows.
 - Backed by `netstack-smoltcp`, an asynchronous userspace TCP/IP stack.
+- Binds embedded Fake-IP DNS listeners on `127.0.0.1:53`, `<tun_ip>:53` (retrying up to 20 times at 500 ms intervals to accommodate asynchronous IP assignment by Windows Wintun), and `127.0.0.1:1053`.
 - Incoming packets on `ztna0` are processed in userspace:
   - DNS packets on port 53 are handled directly by the internal DNS engine.
   - TCP SYN packets establish userspace TCP streams. If the destination IP is in the Fake-IP pool, the original corporate FQDN is looked up and dialed over the HTTP/2 tunnel. If it matches a corporate CIDR, the IP:port is dialed directly.
   - UDP datagrams are dispatched to UDP tunnel streams using RFC 9298 MASQUE.
 
-### 3.3 Linux Routing & Split-DNS Manager (`sys_route.rs`)
+### 3.3 System Routing & Split-DNS Manager (`sys_route.rs`)
 
+#### Linux (`ip route`, `firewalld`, `systemd-resolved`)
 - **Kernel Routing (`ip route`):**
   - Routes the Fake-IP subnet `198.18.0.0/15` through `ztna0`.
   - Routes all policy-defined corporate CIDRs (e.g., `10.0.0.0/8`, `172.16.0.0/12`) through `ztna0`.
 - **Firewall Integration:** Adds `ztna0` to the `firewalld` `trusted` zone if `firewalld` is active.
 - **Split-DNS via `systemd-resolved`:**
-  - Configures `resolvectl dns ztna0 127.0.0.1` (or `<tun_ip>`).
+  - Configures `resolvectl dns ztna0 127.0.0.1` for reliable resolution over loopback.
   - Prunes redundant subdomains (e.g., keeping `~example.com` while pruning `~sub.example.com`).
   - Configures routing domains `resolvectl domain ztna0 ~domain1 ~domain2`.
 - **Signal Handling & Teardown:** Listens for `SIGINT` / `SIGTERM` to cleanly remove routes, reset `resolvectl` domains, and tear down the TUN interface before exiting.
+
+#### Windows (`netsh`, PowerShell NRPT)
+- **System Routing (`netsh`):**
+  - Adds active routes (`store=active`) for `198.18.0.0/15` and all policy-defined corporate IPv4 CIDRs via `netsh interface ipv4 add route prefix=<cidr> interface=ztna0 nexthop=0.0.0.0 store=active`.
+- **Split-DNS via NRPT (`Add-DnsClientNrptRule`):**
+  - Removes any stale NRPT rules tagged with `Comment -eq 'open-cisco-zta'` left by previous unclean exits.
+  - Registers both suffix (`'.domain'`) and exact (`'domain'`) namespace rules pointing to `<tun_ip>` (`100.64.0.1`, as Windows NRPT requires a routable interface IP) and flushes the Windows DNS cache (`Clear-DnsClientCache`).
+- **Signal Handling & Teardown:** On shutdown (`Ctrl+C`), removes all `open-cisco-zta` NRPT rules, flushes the DNS client cache, and removes routes bound to the TUN interface (`Remove-NetRoute`).
 
 ---
 
@@ -327,7 +338,7 @@ open-cisco-zta/
 │   ├── cli-reference.md      # CLI subcommands, flags, and environment variables
 │   ├── configuration.md      # Configuration directory, file formats & JSON schemas
 │   └── enrollment.md         # Enrollment lifecycle & authentication protocol
-├── packaging/                # Package templates (.deb, .rpm, Arch PKGBUILD)
+├── packaging/                # Package templates (.deb, .rpm, Arch PKGBUILD, Windows PowerShell helpers)
 ├── scripts/                  # Build and release automation scripts
 ├── systemd/                  # Background systemd service unit template
 ├── src/
@@ -352,8 +363,8 @@ open-cisco-zta/
 │   │   └── socks5.rs         # Local SOCKS5h proxy server
 │   ├── net/                  # Network stack and routing
 │   │   ├── fakeip.rs         # Fake-IP pool (198.18.0.0/15) & micro-DNS server
-│   │   ├── sys_route.rs      # systemd-resolved and kernel route manager (Linux)
-│   │   └── tun_device.rs     # Virtual TUN interface & netstack-smoltcp bridge
+│   │   ├── sys_route.rs      # System route & Split-DNS manager (Linux systemd-resolved/ip, Windows NRPT/netsh)
+│   │   └── tun_device.rs     # Virtual TUN interface (Linux TUN / Windows Wintun) & netstack-smoltcp bridge
 │   └── plugins/              # Posture and metadata plugins
 │       └── acidex.rs         # Acidex payload synthesizer & OS Profile spoofing
 ├── Cargo.toml                # Project dependencies and packaging metadata

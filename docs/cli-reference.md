@@ -59,7 +59,7 @@ sudo open-cisco-zta enroll --allow-root
 
 ### 2. `run`
 
-Run the ZTNA client daemon. Depending on privileges and flags, this starts a full-system Linux TUN interface with Split-DNS, or a local userspace SOCKS5h proxy server.
+Run the ZTNA client daemon. Depending on privileges and flags, this starts a full-system Linux or Windows TUN interface with Split-DNS, or a local userspace SOCKS5h proxy server.
 
 ```bash
 open-cisco-zta run [OPTIONS]
