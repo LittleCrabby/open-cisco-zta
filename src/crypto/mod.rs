@@ -415,6 +415,23 @@ fn load_private_key_via_ossl_store(builder: &mut SslConnectorBuilder, uri: &str)
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn load_windows_root_certs(builder: &mut openssl::ssl::SslConnectorBuilder) {
+    use schannel::cert_store::CertStore;
+
+    let stores = [
+        CertStore::open_current_user("ROOT"),
+        CertStore::open_local_machine("ROOT"),
+    ];
+    for store in stores.into_iter().flatten() {
+        for cert in store.certs() {
+            if let Ok(x509) = openssl::x509::X509::from_der(cert.to_der()) {
+                let _ = builder.cert_store_mut().add_cert(x509);
+            }
+        }
+    }
+}
+
 pub fn create_ssl_connector(config: &TlsConfig) -> Result<SslConnector> {
     let mut builder = SslConnector::builder(SslMethod::tls_client())
         .context("Failed to create OpenSSL SslConnector builder")?;
@@ -446,6 +463,10 @@ pub fn create_ssl_connector(config: &TlsConfig) -> Result<SslConnector> {
             }
         }
     }
+
+    // The statically linked OpenSSL has no default trust roots on Windows: use the system store
+    #[cfg(target_os = "windows")]
+    load_windows_root_certs(&mut builder);
 
     // Load Client Certificate Chain (Leaf + Intermediate CA)
     if let Some(ref cert_path) = config.cert_path {
