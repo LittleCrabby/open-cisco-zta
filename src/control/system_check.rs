@@ -26,7 +26,7 @@ pub fn check_enroll_privileges(allow_root: bool) -> Result<()> {
     Ok(())
 }
 
-/// Checks if `run` in full system mode (TUN + Split-DNS) has root privileges on Linux.
+/// Checks if `run` in full system mode (TUN + Split-DNS) has root privileges on Linux or administrator rights on Windows.
 pub fn check_run_privileges(proxy_only: bool) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -44,6 +44,33 @@ pub fn check_run_privileges(proxy_only: bool) -> Result<()> {
                        sudo open-cisco-zta run\n\n\
                    • Or run in unprivileged SOCKS5h proxy mode (no root required):\n\
                        open-cisco-zta run --proxy-only\n"
+            );
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if proxy_only {
+            return Ok(());
+        }
+
+        // S-1-16-12288 is the High mandatory level SID present in an elevated token
+        let elevated = std::process::Command::new("whoami")
+            .arg("/groups")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("S-1-16-12288"))
+            .unwrap_or(false);
+        if !elevated {
+            bail!(
+                "Administrator privileges are required to create the virtual
+                 TUN interface and configure system routing tables.
+
+                 How to fix:
+                   • Run from an elevated PowerShell (Run as administrator):
+                       open-cisco-zta run
+
+                   • Or run in unprivileged SOCKS5h proxy mode:
+                       open-cisco-zta run --proxy-only
+"
             );
         }
     }

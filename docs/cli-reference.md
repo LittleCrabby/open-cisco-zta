@@ -69,14 +69,14 @@ open-cisco-zta run [OPTIONS]
 
 | Flag / Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--proxy-only` | Flag | `false` | Run in userspace SOCKS5h proxy mode only (no TUN interface, no root needed). |
+| `--proxy-only` | Flag | `false` | Run in userspace SOCKS5h proxy mode only (no TUN interface, no root/Administrator needed). On Windows, omit it to use Wintun TUN mode. |
 | `-f, --force` | Flag | `false` | Force start even if conflicting official Cisco daemons (`csc_zta_agent`, `acsockd`) are detected. |
 | `--os-profile <PROFILE>`<br>*(alias: `--spoof-os`)* | String | Profile from `enrollment.json` | Override client OS posture profile (`auto`, `linux`, `windows`). |
 | `--socks-addr <IP:PORT>` | SocketAddr | `127.0.0.1:1080` | Local SOCKS5h proxy listen address. |
 | `--dns-addr <IP:PORT>` | SocketAddr | `127.0.0.1:1053` | Embedded Fake-IP DNS server listen address. |
 | `--upstream-dns <IP:PORT>` | SocketAddr | `1.1.1.1:53` | Upstream DNS resolver for non-corporate public domains. |
-| `--tun-name <NAME>` | String | `ztna0` | Virtual TUN interface name (Linux only). |
-| `--tun-ip <IPV4>` | IPv4 | `100.64.0.1` | Local IPv4 address assigned to the TUN interface (Linux only). |
+| `--tun-name <NAME>` | String | `ztna0` | Virtual TUN interface name (Linux and Windows). |
+| `--tun-ip <IPV4>` | IPv4 | `100.64.0.1` | Local IPv4 address assigned to the TUN interface (Linux and Windows). |
 | `-c, --config-dir <PATH>` | Path | `~/.config/open-cisco-zta` | Custom configuration directory path. |
 
 #### Examples
@@ -88,8 +88,11 @@ sudo open-cisco-zta run
 # Linux unprivileged mode (no root needed, local SOCKS5h proxy on 127.0.0.1:1080):
 open-cisco-zta run --proxy-only
 
-# Windows native execution (PowerShell):
+# Windows full-system TUN mode (elevated PowerShell, wintun.dll next to the exe):
 open-cisco-zta.exe run
+
+# Windows unprivileged SOCKS5h proxy mode:
+open-cisco-zta.exe run --proxy-only
 
 # Custom SOCKS5 and DNS listen ports:
 open-cisco-zta run --proxy-only --socks-addr 127.0.0.1:8080 --dns-addr 127.0.0.1:5353
