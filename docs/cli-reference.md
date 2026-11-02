@@ -173,7 +173,7 @@ open-cisco-zta sync
 
 | Variable | Description |
 | :--- | :--- |
-| `OPEN_CISCO_ZTA_CONFIG_DIR` | Overrides the base configuration directory path. |
+| `OPEN_CISCO_ZTA_CONFIG_DIR` | Overrides the base configuration directory path. Evaluated after `--config-dir` (CLI flag takes precedence) but before default OS paths. Commonly used in systemd service drop-ins. |
 | `OPEN_CISCO_ZTA_NO_UPDATE_CHECK` | Set to `1` or `true` to disable background release update checks. |
 | `CI` | When set to `1` or `true`, automatically disables release update checks. |
 | `SUDO_USER` | On Linux, inspected when running under `sudo` to determine the user's home configuration directory. |

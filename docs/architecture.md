@@ -311,7 +311,8 @@ To maintain posture credibility with Cisco's identity checks, the selected OS pr
   - When `sudo open-cisco-zta run` is invoked, `ConfigManager::default_dir()` inspects `std::env::var("SUDO_USER")`.
   - It resolves the real user's home directory via `libc::getpwnam_r` and reads from `/home/<SUDO_USER>/.config/open-cisco-zta`.
   - This ensures users can enroll without `sudo` and run the tunnel with `sudo` without needing to duplicate keys or re-enroll as root.
-- **Environment override:** `OPEN_CISCO_ZTA_CONFIG_DIR` overrides the default path.
+- **Environment override:** `OPEN_CISCO_ZTA_CONFIG_DIR` overrides the default path (evaluated after the `--config-dir` CLI option).
+- **Systemd background service:** When running as a system daemon ([`systemd/open-cisco-zta.service`](file:///home/crabby/Experiments/open-cisco-zta/systemd/open-cisco-zta.service)), the process runs as root directly where `SUDO_USER` is absent. A drop-in unit specifying `Environment=OPEN_CISCO_ZTA_CONFIG_DIR=/home/<user>/.config/open-cisco-zta` instructs the daemon to load the user's enrollment. The service includes `CAP_DAC_OVERRIDE` in `CapabilityBoundingSet` so root can read the user's restricted private keys (`0600`) and write policy updates (`enrollment.json`, `ztna_config.json`) during background syncs.
 
 ---
 

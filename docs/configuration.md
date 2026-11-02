@@ -4,29 +4,102 @@ This document explains the configuration directory layout, file formats, and sta
 
 ---
 
-## 📁 Directory Paths
+## 📁 Directory Paths & Resolution
 
 `open-cisco-zta` stores client state, cryptographic keys, certificates, and cached policy tables in a standard OS configuration directory:
 
-| Operating System | Default Directory Path |
+| Operating System / Context | Default Directory Path |
 | :--- | :--- |
-| **Linux (Normal user)** | `~/.config/open-cisco-zta/` |
+| **Linux (Normal user)** | `~/.config/open-cisco-zta/` (`$HOME/.config/open-cisco-zta/`) |
 | **Linux (via `sudo`)** | `/home/<SUDO_USER>/.config/open-cisco-zta/` |
+| **Linux (Root / System Service)** | `/root/.config/open-cisco-zta/` *(unless overridden)* |
 | **Windows** | `%APPDATA%\open-cisco-zta\` (e.g., `C:\Users\<User>\AppData\Roaming\open-cisco-zta\`) |
 
-### Path Resolution Invariant (`SUDO_USER`)
-When running `sudo open-cisco-zta run` on Linux, the configuration manager inspects the `SUDO_USER` environment variable and resolves that user's home directory via `libc::getpwnam_r`. This allows a user to run `open-cisco-zta enroll` unprivileged as their standard desktop user, and then execute `sudo open-cisco-zta run` without losing access to their configuration or having to duplicate certificates into `/root/.config/open-cisco-zta/`.
+---
 
-### Overriding the Configuration Directory
-You can override the configuration path using either:
-- The `-c` or `--config-dir` CLI option:
-  ```bash
-  open-cisco-zta run --config-dir /custom/path/open-cisco-zta
-  ```
-- The `OPEN_CISCO_ZTA_CONFIG_DIR` environment variable:
-  ```bash
-  export OPEN_CISCO_ZTA_CONFIG_DIR=/custom/path/open-cisco-zta
-  ```
+### Path Resolution Precedence
+
+When resolving the configuration directory path, [`ConfigManager::default_dir()`](file:///home/crabby/Experiments/open-cisco-zta/src/config/mod.rs#L49-L73) evaluates candidate paths in the following priority order:
+
+1. **CLI Flag (`-c` / `--config-dir <PATH>`)**: Highest priority; explicitly overrides all environment variables and platform defaults for that invocation.
+2. **Environment Variable (`OPEN_CISCO_ZTA_CONFIG_DIR`)**: Checked if no CLI flag is provided. Useful for persistent terminal sessions, automated scripts, and systemd service units.
+3. **Windows Environment Variables**: Checks `%APPDATA%\open-cisco-zta`, followed by `%USERPROFILE%\.config\open-cisco-zta`.
+4. **Linux `sudo` Invocation (`SUDO_USER`)**: When running under `sudo` on Linux, the daemon inspects the `SUDO_USER` variable and resolves that user's home directory via `libc::getpwnam_r` (`/home/<SUDO_USER>/.config/open-cisco-zta`). This ensures an unprivileged `open-cisco-zta enroll` works seamlessly with `sudo open-cisco-zta run`.
+5. **Standard User Fallback (`HOME`)**: Resolves `$HOME/.config/open-cisco-zta` (defaulting to `/root/.config/open-cisco-zta` when run directly as root without `SUDO_USER`).
+
+---
+
+### How to Change the Configuration Directory
+
+You can customize or relocate the configuration directory using one of three approaches:
+
+#### 1. Command-Line Option (`-c` / `--config-dir`)
+
+Pass the `-c` or `--config-dir` argument directly to any subcommand (`enroll`, `run`, `status`, `sync`). This option takes the highest precedence:
+
+```bash
+# Enroll using a custom path:
+open-cisco-zta enroll --config-dir /var/lib/open-cisco-zta
+
+# Run the tunnel daemon pointing to that directory:
+sudo open-cisco-zta run -c /var/lib/open-cisco-zta
+
+# Inspect status or trigger a manual policy sync:
+open-cisco-zta status -c /var/lib/open-cisco-zta
+open-cisco-zta sync -c /var/lib/open-cisco-zta
+```
+
+#### 2. Environment Variable (`OPEN_CISCO_ZTA_CONFIG_DIR`)
+
+Set the `OPEN_CISCO_ZTA_CONFIG_DIR` environment variable to apply a custom path globally to all commands without supplying `-c` on each call:
+
+```bash
+# Export in current shell session:
+export OPEN_CISCO_ZTA_CONFIG_DIR=/custom/path/open-cisco-zta
+open-cisco-zta run
+
+# Or pass inline for a single command:
+OPEN_CISCO_ZTA_CONFIG_DIR=/custom/path/open-cisco-zta open-cisco-zta status
+```
+
+#### 3. Systemd Service Unit Drop-in (Linux Background Daemon)
+
+When running `open-cisco-zta` as a persistent background daemon via systemd ([`systemd/open-cisco-zta.service`](file:///home/crabby/Experiments/open-cisco-zta/systemd/open-cisco-zta.service)), the service runs directly as `root` outside an interactive desktop user session. Consequently:
+- `SUDO_USER` is **not** set.
+- Without an override, the service searches for enrollment files in `/root/.config/open-cisco-zta/`.
+- Client enrollment must be executed as an unprivileged user (`open-cisco-zta enroll`) to launch desktop browsers and capture SSO cookies, meaning your credentials reside in `/home/<your-user>/.config/open-cisco-zta`.
+
+To point the systemd service to your user configuration directory, create a systemd drop-in file:
+
+```bash
+# Edit drop-in override for open-cisco-zta service:
+sudo systemctl edit open-cisco-zta
+```
+
+In the editor that opens, insert the following configuration:
+
+```ini
+[Service]
+Environment=OPEN_CISCO_ZTA_CONFIG_DIR=/home/<your-user>/.config/open-cisco-zta
+```
+
+Replace `<your-user>` with your Linux username. Then reload systemd and start the service:
+
+```bash
+# Reload systemd manager configuration:
+sudo systemctl daemon-reload
+
+# Enable and start service on boot:
+sudo systemctl enable --now open-cisco-zta
+
+# Inspect status and runtime logs:
+systemctl status open-cisco-zta
+journalctl -u open-cisco-zta -f
+```
+
+> [!NOTE]
+> **Filesystem Permissions & `CAP_DAC_OVERRIDE`:**
+> User home directories are typically restricted to `0700` or `0710` permissions, and `client_key.pem` is created with `0600` permissions. The provided [`open-cisco-zta.service`](file:///home/crabby/Experiments/open-cisco-zta/systemd/open-cisco-zta.service) includes `CAP_DAC_OVERRIDE` in `CapabilityBoundingSet`. This allows the root-level daemon to traverse user home directories, read the mTLS private keys, and update policy files (`enrollment.json`, `ztna_config.json`) during background syncs without requiring permission compromises.
 
 ---
 
