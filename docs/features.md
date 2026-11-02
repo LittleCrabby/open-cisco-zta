@@ -22,6 +22,10 @@ This document provides an exhaustive breakdown of the features and capabilities 
 - **Remote DNS Resolution:** Supports standard SOCKS5h (RFC 1928), delegating domain resolution to the internal Fake-IP engine.
 - **Wide Client Support:** Easily consumed by web browsers (Firefox, Chrome, Edge), developer tools (`git`, `curl`), SSH clients (`ProxyCommand nc -X 5`), and system-wide proxifiers (Proxifier, Tun2Socks).
 
+#### Windows Packaging Helpers (`packaging/windows/`)
+- **Per-user install:** `install.ps1` / `uninstall.ps1` copy `open-cisco-zta.exe` (plus `wintun.dll` if present next to it) into `%LOCALAPPDATA%\Programs\open-cisco-zta` and add or remove that directory in the user `PATH`; no Administrator rights needed.
+- **Background run:** `ocz-start` / `ocz-stop` (`.ps1`, and double-clickable `.cmd` wrappers) start `open-cisco-zta run` hidden in the background (log: `%LOCALAPPDATA%\open-cisco-zta\run.log`) and stop it again, removing any leftover `ztna0` routes and `open-cisco-zta` NRPT rules. Both request elevation via UAC.
+
 ---
 
 ### 2. High-Performance HTTP/2 Multiplexing & RFC 9298 MASQUE
