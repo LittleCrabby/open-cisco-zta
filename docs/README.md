@@ -22,5 +22,5 @@ This documentation provides an in-depth reference for architects, developers, se
 
 - **Clean-Room Implementation:** Implemented from scratch without proprietary Cisco binaries, drivers, or kernel daemons.
 - **Strict Protocol Compliance:** Enforces Cisco-specific protocol extensions (RFC 9449 DPoP composite headers, custom ACME `ZtnaUriList` and `ztna-jwt` challenges, RFC 9298 MASQUE `CONNECT-UDP` encapsulation).
-- **Userspace Networking:** Provides transparent system-wide tunneling via Linux TUN and a userspace TCP/IP stack (`netstack-smoltcp`), as well as an unprivileged SOCKS5h proxy on both Linux and Windows.
+- **Userspace Networking:** Provides transparent system-wide tunneling via Linux/Windows TUN and a userspace TCP/IP stack (`netstack-smoltcp`), as well as an unprivileged SOCKS5h proxy on both Linux and Windows.
 - **Privacy & Isolation:** Corporate DNS traffic is handled via synthetic Fake-IPs (`198.18.0.0/15`) with zero leakage of corporate domain queries to upstream resolvers. Non-corporate traffic is completely untouched.

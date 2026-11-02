@@ -10,14 +10,15 @@ This document provides an exhaustive breakdown of the features and capabilities 
 
 `open-cisco-zta` provides two distinct modes for data plane ingress:
 
-#### Linux Full-System Mode (Virtual TUN Interface)
+#### Linux & Windows Full-System Mode (Virtual TUN Interface)
 - **Virtual TUN Interface:** Allocates a virtual network interface (`ztna0`, configurable via `--tun-name`) with IP `100.64.0.1/32` (configurable via `--tun-ip`).
 - **Userspace TCP/IP Stack (`netstack-smoltcp`):** Processes incoming raw IP packets entirely in userspace without requiring custom kernel modules, eBPF programs, or kernel drivers.
 - **Transparent Routing:** All corporate applications (curl, browsers, SSH, database GUIs, Docker containers, Kubernetes tooling) route through the tunnel automatically without application-specific proxy configurations.
 - **Graceful Lifecycle:** Automatically restores all kernel routes, DNS configurations, and interface states on termination (`SIGINT`, `SIGTERM`).
+- **Windows specifics:** Uses the Wintun driver (`wintun.dll` must sit next to the executable) and requires an elevated shell. Routes are added with `netsh`, and Split-DNS is implemented with NRPT rules (`Add-DnsClientNrptRule`, tagged with comment `open-cisco-zta`) pointing at the TUN IP; the rules are removed on shutdown.
 
 #### Windows & Linux Unprivileged Mode (Local SOCKS5h Proxy)
-- **Zero-Privilege Execution:** Runs entirely under regular user permissions without requiring root, `sudo`, or Windows Administrator elevation.
+- **Zero-Privilege Execution:** Runs entirely under regular user permissions without requiring root, `sudo`, or Windows Administrator elevation (`--proxy-only`).
 - **Local Proxy Endpoint:** Starts a high-performance SOCKS5h proxy server on `127.0.0.1:1080` (configurable via `--socks-addr`).
 - **Remote DNS Resolution:** Supports standard SOCKS5h (RFC 1928), delegating domain resolution to the internal Fake-IP engine.
 - **Wide Client Support:** Easily consumed by web browsers (Firefox, Chrome, Edge), developer tools (`git`, `curl`), SSH clients (`ProxyCommand nc -X 5`), and system-wide proxifiers (Proxifier, Tun2Socks).

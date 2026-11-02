@@ -135,7 +135,7 @@ The `ConfigSync` service keeps corporate routing rules up-to-date:
 ### 1.4 System Checks & Pre-Flight Validations (`system_check.rs`)
 
 - **Root Enrollment Prevention (`check_enroll_privileges`):** Prevents running `enroll` as root/sudo on Linux to avoid launching GUI browsers in root context or saving config files with root ownership. Can be explicitly bypassed with `--allow-root`.
-- **TUN Privilege Check (`check_run_privileges`):** Validates that full TUN mode runs with root/sudo or `CAP_NET_ADMIN`, offering helpful instructions to run `sudo open-cisco-zta run` or switch to unprivileged `--proxy-only`.
+- **TUN Privilege Check (`check_run_privileges`):** Validates that full TUN mode runs with root/sudo or `CAP_NET_ADMIN` on Linux, or from an elevated shell on Windows, offering helpful instructions to run `sudo open-cisco-zta run` or switch to unprivileged `--proxy-only`.
 - **Cisco Daemon Conflict Discovery (`check_conflicting_cisco_agents`):** Inspects the process table for active official Cisco Secure Client daemons (`csc_zta_agent`, `acsockd`, `vpnagentd`) to avoid interface and port collisions. Can be bypassed with `-f` / `--force`.
 
 ### 1.5 Non-Blocking Update Checker (`update_check.rs`)
