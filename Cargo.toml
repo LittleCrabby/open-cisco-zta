@@ -1,6 +1,6 @@
 [package]
 name = "open-cisco-zta"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 authors = ["LittleCrabby"]
 description = "High-performance alternative client for Cisco Secure Access ZTNA"
