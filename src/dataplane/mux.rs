@@ -3,6 +3,7 @@ use crate::plugins::{DefaultAcidexProvider, FlowInfo, FlowMetadataProvider};
 use anyhow::{bail, Context, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use http::{HeaderMap, Method, Request, Version};
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -79,6 +80,9 @@ impl Http2MuxTransport {
         let tcp = TcpStream::connect((self.proxy_host.as_str(), self.proxy_port))
             .await
             .with_context(|| format!("Failed to connect TCP to {}:{}", self.proxy_host, self.proxy_port))?;
+        if let Err(e) = tcp.set_nodelay(true) {
+            tracing::debug!("Failed to set TCP_NODELAY on proxy connection: {:?}", e);
+        }
 
         let ssl = connector
             .configure()?
@@ -128,17 +132,16 @@ impl Http2MuxTransport {
         Ok(client)
     }
 
+    async fn invalidate_client(&self) {
+        let mut w = self.send_request.write().await;
+        *w = None;
+    }
+
     pub async fn open_tcp_tunnel(
         &self,
         authority: &str,
         src_addr: Option<SocketAddr>,
     ) -> Result<H2TunnelStream> {
-        let client = self.get_or_create_client().await?;
-        let mut ready_client = client
-            .ready()
-            .await
-            .map_err(|e| anyhow::anyhow!("H2 client not ready: {:?}", e))?;
-
         let (host_str, port_num) = if let Some((h, p)) = authority.split_once(':') {
             (h.to_string(), p.parse::<u16>().unwrap_or(443))
         } else {
@@ -151,42 +154,88 @@ impl Http2MuxTransport {
             dst_port: port_num,
         };
 
-        let mut req = Request::builder()
-            .method(Method::CONNECT)
-            .uri(authority);
-
         let mut headers = HeaderMap::new();
         self.flow_provider.append_headers(&flow_info, &mut headers);
-        for (k, v) in headers.into_iter() {
-            if let Some(key) = k {
-                req = req.header(key, v);
+
+        for attempt in 0..2 {
+            let client = self.get_or_create_client().await?;
+            let mut ready_client = match client.ready().await {
+                Ok(c) => c,
+                Err(e) => {
+                    self.invalidate_client().await;
+                    if attempt == 0 {
+                        tracing::warn!(
+                            "Cached H2 client not ready for {} ({:?}); reconnecting and retrying",
+                            authority,
+                            e
+                        );
+                        continue;
+                    }
+                    bail!("H2 client not ready: {:?}", e);
+                }
+            };
+
+            let mut req = Request::builder()
+                .method(Method::CONNECT)
+                .uri(authority);
+
+            for (k, v) in headers.iter() {
+                req = req.header(k, v);
+            }
+
+            let request = req.body(())?;
+            tracing::info!("Sending HTTP/2 CONNECT to authority {}", authority);
+
+            let (response_future, send_stream) = match ready_client.send_request(request, false) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    self.invalidate_client().await;
+                    if attempt == 0 {
+                        tracing::warn!(
+                            "Failed to send CONNECT on cached H2 connection for {} ({:?}); reconnecting and retrying",
+                            authority,
+                            e
+                        );
+                        continue;
+                    }
+                    bail!("Failed to send CONNECT request: {:?}", e);
+                }
+            };
+
+            let response = match response_future.await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if e.is_io() || e.is_go_away() || e.is_library() {
+                        self.invalidate_client().await;
+                        if attempt == 0 {
+                            tracing::warn!(
+                                "H2 connection error awaiting CONNECT response for {} ({:?}); reconnecting and retrying",
+                                authority,
+                                e
+                            );
+                            continue;
+                        }
+                    }
+                    bail!("CONNECT response error: {:?}", e);
+                }
+            };
+
+            let status = response.status();
+            tracing::info!("CONNECT response status for {}: {}", authority, status);
+
+            if status == http::StatusCode::OK {
+                let (_, recv_stream) = response.into_parts();
+                return Ok(H2TunnelStream::new(send_stream, recv_stream));
+            } else if status == http::StatusCode::FORBIDDEN {
+                bail!("HTTP/2 CONNECT forbidden (403) by Cisco ZTNA policy for {}", authority);
+            } else if status == http::StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+                bail!("HTTP/2 CONNECT proxy authentication required (407) for {}", authority);
+            } else {
+                bail!("HTTP/2 CONNECT rejected with status {} for {}", status, authority);
             }
         }
 
-        let request = req.body(())?;
-        tracing::info!("Sending HTTP/2 CONNECT to authority {}", authority);
-
-        let (response_future, send_stream) = ready_client
-            .send_request(request, false)
-            .map_err(|e| anyhow::anyhow!("Failed to send CONNECT request: {:?}", e))?;
-
-        let response = response_future
-            .await
-            .map_err(|e| anyhow::anyhow!("CONNECT response error: {:?}", e))?;
-
-        let status = response.status();
-        tracing::info!("CONNECT response status for {}: {}", authority, status);
-
-        if status == http::StatusCode::OK {
-            let (_, recv_stream) = response.into_parts();
-            Ok(H2TunnelStream::new(send_stream, recv_stream))
-        } else if status == http::StatusCode::FORBIDDEN {
-            bail!("HTTP/2 CONNECT forbidden (403) by Cisco ZTNA policy for {}", authority);
-        } else if status == http::StatusCode::PROXY_AUTHENTICATION_REQUIRED {
-            bail!("HTTP/2 CONNECT proxy authentication required (407) for {}", authority);
-        } else {
-            bail!("HTTP/2 CONNECT rejected with status {} for {}", status, authority);
-        }
+        unreachable!()
     }
 
     /// Opens an Extended CONNECT (`CONNECT-UDP`, RFC 8441 / RFC 9298 MASQUE) stream over HTTP/2.
@@ -195,12 +244,6 @@ impl Http2MuxTransport {
         authority: &str,
         src_addr: Option<SocketAddr>,
     ) -> Result<H2UdpStream> {
-        let client = self.get_or_create_client().await?;
-        let mut ready_client = client
-            .ready()
-            .await
-            .map_err(|e| anyhow::anyhow!("H2 client not ready: {:?}", e))?;
-
         let (host_str, port_num) = if let Some((h, p)) = authority.split_once(':') {
             (h.to_string(), p.parse::<u16>().unwrap_or(53))
         } else {
@@ -218,64 +261,110 @@ impl Http2MuxTransport {
             self.proxy_host, host_str, port_num
         );
 
-        let mut req = Request::builder()
-            .method(Method::CONNECT)
-            .uri(&masque_uri)
-            .version(Version::HTTP_2);
-
         let mut headers = HeaderMap::new();
         self.flow_provider.append_headers(&flow_info, &mut headers);
-        for (k, v) in headers.into_iter() {
-            if let Some(key) = k {
-                req = req.header(key, v);
+
+        for attempt in 0..2 {
+            let client = self.get_or_create_client().await?;
+            let mut ready_client = match client.ready().await {
+                Ok(c) => c,
+                Err(e) => {
+                    self.invalidate_client().await;
+                    if attempt == 0 {
+                        tracing::warn!(
+                            "Cached H2 client not ready for UDP {} ({:?}); reconnecting and retrying",
+                            authority,
+                            e
+                        );
+                        continue;
+                    }
+                    bail!("H2 client not ready: {:?}", e);
+                }
+            };
+
+            let mut req = Request::builder()
+                .method(Method::CONNECT)
+                .uri(&masque_uri)
+                .version(Version::HTTP_2);
+
+            for (k, v) in headers.iter() {
+                req = req.header(k, v);
+            }
+
+            let mut request = req.body(())?;
+            request
+                .extensions_mut()
+                .insert(h2::ext::Protocol::from_static("CONNECT-UDP"));
+
+            tracing::info!(
+                "Sending HTTP/2 Extended CONNECT (CONNECT-UDP) for {} via {}",
+                authority,
+                masque_uri
+            );
+
+            let (response_future, send_stream) = match ready_client.send_request(request, false) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    self.invalidate_client().await;
+                    if attempt == 0 {
+                        tracing::warn!(
+                            "Failed to send CONNECT-UDP on cached H2 connection for {} ({:?}); reconnecting and retrying",
+                            authority,
+                            e
+                        );
+                        continue;
+                    }
+                    bail!("Failed to send CONNECT-UDP request: {:?}", e);
+                }
+            };
+
+            let response = match response_future.await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if e.is_io() || e.is_go_away() || e.is_library() {
+                        self.invalidate_client().await;
+                        if attempt == 0 {
+                            tracing::warn!(
+                                "H2 connection error awaiting CONNECT-UDP response for {} ({:?}); reconnecting and retrying",
+                                authority,
+                                e
+                            );
+                            continue;
+                        }
+                    }
+                    bail!("CONNECT-UDP response error: {:?}", e);
+                }
+            };
+
+            let status = response.status();
+            tracing::info!("CONNECT-UDP response status for {}: {}", authority, status);
+
+            if status == http::StatusCode::OK {
+                let (_, recv_stream) = response.into_parts();
+                return Ok(H2UdpStream::new(H2TunnelStream::new(
+                    send_stream,
+                    recv_stream,
+                )));
+            } else if status == http::StatusCode::FORBIDDEN {
+                bail!(
+                    "HTTP/2 CONNECT-UDP forbidden (403) by Cisco ZTNA policy for {}",
+                    authority
+                );
+            } else if status == http::StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+                bail!(
+                    "HTTP/2 CONNECT-UDP proxy authentication required (407) for {}",
+                    authority
+                );
+            } else {
+                bail!(
+                    "HTTP/2 CONNECT-UDP rejected with status {} for {}",
+                    status,
+                    authority
+                );
             }
         }
 
-        let mut request = req.body(())?;
-        request
-            .extensions_mut()
-            .insert(h2::ext::Protocol::from_static("CONNECT-UDP"));
-
-        tracing::info!(
-            "Sending HTTP/2 Extended CONNECT (CONNECT-UDP) for {} via {}",
-            authority,
-            masque_uri
-        );
-
-        let (response_future, send_stream) = ready_client
-            .send_request(request, false)
-            .map_err(|e| anyhow::anyhow!("Failed to send CONNECT-UDP request: {:?}", e))?;
-
-        let response = response_future
-            .await
-            .map_err(|e| anyhow::anyhow!("CONNECT-UDP response error: {:?}", e))?;
-
-        let status = response.status();
-        tracing::info!("CONNECT-UDP response status for {}: {}", authority, status);
-
-        if status == http::StatusCode::OK {
-            let (_, recv_stream) = response.into_parts();
-            Ok(H2UdpStream::new(H2TunnelStream::new(
-                send_stream,
-                recv_stream,
-            )))
-        } else if status == http::StatusCode::FORBIDDEN {
-            bail!(
-                "HTTP/2 CONNECT-UDP forbidden (403) by Cisco ZTNA policy for {}",
-                authority
-            );
-        } else if status == http::StatusCode::PROXY_AUTHENTICATION_REQUIRED {
-            bail!(
-                "HTTP/2 CONNECT-UDP proxy authentication required (407) for {}",
-                authority
-            );
-        } else {
-            bail!(
-                "HTTP/2 CONNECT-UDP rejected with status {} for {}",
-                status,
-                authority
-            );
-        }
+        unreachable!()
     }
 }
 
@@ -443,20 +532,42 @@ impl H2UdpStream {
     }
 }
 
+/// Interval for sending 0-byte HTTP/2 `DATA` frames on idle tunnel streams so that
+/// Cisco ZPC Envoy proxies reset their per-stream `stream_idle_timeout` even when OS
+/// TCP keep-alives are terminated locally by the userspace TUN netstack.
+const STREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(28);
+
+/// Maximum time to wait for the opposite direction to finish after one side of a
+/// tunneled TCP connection sends `EOF` (`FIN` / `END_STREAM`). Prevents tasks and
+/// HTTP/2 streams from leaking when a local application leaves sockets in `CLOSE-WAIT`.
+const HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct H2TunnelStream {
     send_stream: h2::SendStream<Bytes>,
     recv_stream: h2::RecvStream,
     read_buf: Option<Bytes>,
     eof_sent: bool,
+    keepalive_interval: Duration,
+    keepalive_sleep: Pin<Box<tokio::time::Sleep>>,
 }
 
 impl H2TunnelStream {
     pub fn new(send_stream: h2::SendStream<Bytes>, recv_stream: h2::RecvStream) -> Self {
+        Self::with_keepalive_interval(send_stream, recv_stream, STREAM_KEEPALIVE_INTERVAL)
+    }
+
+    pub fn with_keepalive_interval(
+        send_stream: h2::SendStream<Bytes>,
+        recv_stream: h2::RecvStream,
+        keepalive_interval: Duration,
+    ) -> Self {
         Self {
             send_stream,
             recv_stream,
             read_buf: None,
             eof_sent: false,
+            keepalive_interval,
+            keepalive_sleep: Box::pin(tokio::time::sleep(keepalive_interval)),
         }
     }
 }
@@ -485,11 +596,13 @@ impl AsyncRead for H2TunnelStream {
             match self.recv_stream.poll_data(cx) {
                 Poll::Ready(Some(Ok(data))) => {
                     let len = data.len();
-                    // Crucial: release capacity to keep HTTP/2 WINDOW_UPDATE flowing!
-                    if let Err(e) = self.recv_stream.flow_control().release_capacity(len) {
-                        tracing::warn!("Failed to release H2 capacity: {:?}", e);
+                    if len > 0 {
+                        // Crucial: release capacity to keep HTTP/2 WINDOW_UPDATE flowing!
+                        if let Err(e) = self.recv_stream.flow_control().release_capacity(len) {
+                            tracing::warn!("Failed to release H2 capacity: {:?}", e);
+                        }
+                        self.read_buf = Some(data);
                     }
-                    self.read_buf = Some(data);
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Err(io::Error::other(e.to_string())));
@@ -499,6 +612,23 @@ impl AsyncRead for H2TunnelStream {
                     return Poll::Ready(Ok(()));
                 }
                 Poll::Pending => {
+                    if !self.eof_sent && self.keepalive_sleep.as_mut().poll(cx).is_ready() {
+                        let interval = self.keepalive_interval;
+                        self.keepalive_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + interval);
+                        let _ = self.keepalive_sleep.as_mut().poll(cx);
+                        if let Err(e) = self.send_stream.send_data(Bytes::new(), false) {
+                            tracing::debug!(
+                                "H2 stream keepalive send_data failed (stream likely closed): {:?}",
+                                e
+                            );
+                        } else {
+                            tracing::trace!(
+                                "Sent 0-byte HTTP/2 DATA keepalive frame on tunnel stream"
+                            );
+                        }
+                    }
                     return Poll::Pending;
                 }
             }
@@ -532,6 +662,11 @@ impl AsyncWrite for H2TunnelStream {
                     if let Err(e) = self.send_stream.send_data(bytes, false) {
                         return Poll::Ready(Err(io::Error::other(e.to_string())));
                     }
+                    let interval = self.keepalive_interval;
+                    self.keepalive_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + interval);
+                    let _ = self.keepalive_sleep.as_mut().poll(cx);
                     return Poll::Ready(Ok(to_send));
                 }
                 Poll::Ready(Some(Err(e))) => {
@@ -561,6 +696,166 @@ impl AsyncWrite for H2TunnelStream {
         }
         Poll::Ready(Ok(()))
     }
+}
+
+/// Relays data bidirectionally between `a` (local client stream) and `b` (remote tunnel stream)
+/// without blocking indefinitely when one side closes (`EOF`) while the other stays in `CLOSE-WAIT`.
+///
+/// Specifically, `netstack_smoltcp::TcpStream::poll_shutdown` initiates `FIN` on the first call
+/// (`control.send_state = TcpSocketState::Close`) and then returns `Poll::Pending` until the local
+/// client also closes its write half (`TcpState::Closed`). Standard `tokio::io::copy_bidirectional`
+/// hangs forever on `poll_shutdown` if a client (such as an idle JDBC pool in `CLOSE-WAIT`) does
+/// not immediately close its socket. This function initiates write-shutdown as soon as one side
+/// reaches `EOF` and bounds the remaining half-close drain to `HALF_CLOSE_TIMEOUT`.
+pub async fn relay_bidirectional<A, B>(a: &mut A, b: &mut B) -> io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    relay_bidirectional_with_timeout(a, b, HALF_CLOSE_TIMEOUT).await
+}
+
+pub async fn relay_bidirectional_with_timeout<A, B>(
+    a: &mut A,
+    b: &mut B,
+    half_close_timeout: Duration,
+) -> io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    let mut buf_ab = vec![0u8; 16 * 1024];
+    let mut pos_ab = 0usize;
+    let mut cap_ab = 0usize;
+    let mut done_ab = false;
+    let mut total_ab = 0u64;
+
+    let mut buf_ba = vec![0u8; 16 * 1024];
+    let mut pos_ba = 0usize;
+    let mut cap_ba = 0usize;
+    let mut done_ba = false;
+    let mut total_ba = 0u64;
+
+    let mut half_close_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
+
+    futures::future::poll_fn(|cx| {
+        // Direction 1: a -> b
+        while !done_ab {
+            if pos_ab < cap_ab {
+                match Pin::new(&mut *b).poll_write(cx, &buf_ab[pos_ab..cap_ab]) {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "write zero byte into tunnel",
+                        )));
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        pos_ab += n;
+                        total_ab += n as u64;
+                        continue;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => {
+                        let _ = Pin::new(&mut *b).poll_flush(cx);
+                        break;
+                    }
+                }
+            }
+
+            pos_ab = 0;
+            cap_ab = 0;
+            let mut read_buf = ReadBuf::new(&mut buf_ab);
+            match Pin::new(&mut *a).poll_read(cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => {
+                    let n = read_buf.filled().len();
+                    if n == 0 {
+                        let _ = Pin::new(&mut *b).poll_flush(cx);
+                        let _ = Pin::new(&mut *b).poll_shutdown(cx);
+                        done_ab = true;
+                        if half_close_sleep.is_none() && !done_ba {
+                            half_close_sleep =
+                                Some(Box::pin(tokio::time::sleep(half_close_timeout)));
+                        }
+                    } else {
+                        cap_ab = n;
+                    }
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    let _ = Pin::new(&mut *b).poll_flush(cx);
+                    break;
+                }
+            }
+        }
+
+        // Direction 2: b -> a
+        while !done_ba {
+            if pos_ba < cap_ba {
+                match Pin::new(&mut *a).poll_write(cx, &buf_ba[pos_ba..cap_ba]) {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "write zero byte into local stream",
+                        )));
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        pos_ba += n;
+                        total_ba += n as u64;
+                        continue;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => {
+                        let _ = Pin::new(&mut *a).poll_flush(cx);
+                        break;
+                    }
+                }
+            }
+
+            pos_ba = 0;
+            cap_ba = 0;
+            let mut read_buf = ReadBuf::new(&mut buf_ba);
+            match Pin::new(&mut *b).poll_read(cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => {
+                    let n = read_buf.filled().len();
+                    if n == 0 {
+                        let _ = Pin::new(&mut *a).poll_flush(cx);
+                        let _ = Pin::new(&mut *a).poll_shutdown(cx);
+                        done_ba = true;
+                        if half_close_sleep.is_none() && !done_ab {
+                            half_close_sleep =
+                                Some(Box::pin(tokio::time::sleep(half_close_timeout)));
+                        }
+                    } else {
+                        cap_ba = n;
+                    }
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    let _ = Pin::new(&mut *a).poll_flush(cx);
+                    break;
+                }
+            }
+        }
+
+        if done_ab && done_ba {
+            return Poll::Ready(Ok((total_ab, total_ba)));
+        }
+
+        if let Some(ref mut sleep) = half_close_sleep {
+            if sleep.as_mut().poll(cx).is_ready() {
+                if !done_ab {
+                    let _ = Pin::new(&mut *b).poll_shutdown(cx);
+                }
+                if !done_ba {
+                    let _ = Pin::new(&mut *a).poll_shutdown(cx);
+                }
+                return Poll::Ready(Ok((total_ab, total_ba)));
+            }
+        }
+
+        Poll::Pending
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -627,5 +922,103 @@ mod tests {
         let d2 = try_decode_udp_capsule(&mut stream_buf).unwrap().unwrap();
         assert_eq!(&d2[..], small_payload);
         assert!(try_decode_udp_capsule(&mut stream_buf).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_h2_tunnel_stream_sends_keepalive_data_frame() {
+        let (client_io, mut raw_wire) = tokio::io::duplex(64 * 1024);
+        let (mut server_wire, server_io) = tokio::io::duplex(64 * 1024);
+
+        let data_frames_seen = Arc::new( std::sync::atomic::AtomicUsize::new(0));
+        let data_frames_seen_clone = Arc::clone(&data_frames_seen);
+
+        // Proxy raw bytes between client_io and server_io and count 9-byte empty
+        // HTTP/2 DATA frames for Stream ID 1: [0, 0, 0, 0, 0, 0, 0, 0, 1]
+        tokio::spawn(async move {
+            let (mut r_c, mut w_c) = tokio::io::split(&mut raw_wire);
+            let (mut r_s, mut w_s) = tokio::io::split(&mut server_wire);
+            let c_to_s = async {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = r_c.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    // Look for 9-byte empty DATA frame header on stream 1:
+                    // Length = 0x000000 (3 bytes), Type = 0x00 (DATA), Flags = 0x00, Stream ID = 0x00000001
+                    let empty_data_frame = [0u8, 0, 0, 0, 0, 0, 0, 0, 1];
+                    if buf[..n]
+                        .windows(empty_data_frame.len())
+                        .any(|w| w == empty_data_frame)
+                    {
+                        data_frames_seen_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    if w_s.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            let s_to_c = tokio::io::copy(&mut r_s, &mut w_c);
+            let _ = tokio::join!(c_to_s, s_to_c);
+        });
+
+        let server_task = tokio::spawn(async move {
+            let mut server = h2::server::handshake(server_io).await.unwrap();
+            let (_req, mut respond) = server.accept().await.unwrap().unwrap();
+            let resp = http::Response::builder().status(200).body(()).unwrap();
+            let _send = respond.send_response(resp, false).unwrap();
+            while server.accept().await.is_some() {}
+        });
+
+        let (client, h2_conn) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = h2_conn.await;
+        });
+
+        let mut ready = client.ready().await.unwrap();
+        let req = Request::builder()
+            .method(Method::CONNECT)
+            .uri("sqltest.bank.lan:1433")
+            .body(())
+            .unwrap();
+        let (resp_fut, send_stream) = ready.send_request(req, false).unwrap();
+        let resp = resp_fut.await.unwrap();
+        let (_, recv_stream) = resp.into_parts();
+        let mut tunnel = H2TunnelStream::with_keepalive_interval(
+            send_stream,
+            recv_stream,
+            Duration::from_millis(15),
+        );
+
+        let mut buf = [0u8; 64];
+        let _ = tokio::time::timeout(Duration::from_millis(60), tunnel.read(&mut buf)).await;
+        drop(tunnel);
+        drop(ready);
+        let _ = server_task.await;
+
+        assert!(
+            data_frames_seen.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "Expected at least one 0-byte HTTP/2 DATA keepalive frame on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_relay_bidirectional_bounds_close_wait() {
+        // Simulate a local stream whose peer stays in CLOSE-WAIT (never sends EOF)
+        // when the remote tunnel closes first.
+        let (mut local_client, _local_app_kept_open) = tokio::io::duplex(1024);
+        let (mut tunnel_client, mut tunnel_server) = tokio::io::duplex(1024);
+
+        tunnel_server.write_all(b"server greeting").await.unwrap();
+        drop(tunnel_server); // Remote closes tunnel (EOF)
+
+        let (ab, ba) = relay_bidirectional_with_timeout(
+            &mut local_client,
+            &mut tunnel_client,
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ab, 0);
+        assert_eq!(ba, b"server greeting".len() as u64);
     }
 }

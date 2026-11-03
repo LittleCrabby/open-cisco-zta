@@ -380,7 +380,11 @@ impl TunDevice {
 
                         match mux.open_tcp_tunnel(&authority, Some(local_addr)).await {
                             Ok(mut tunnel) => {
-                                let _ = tokio::io::copy_bidirectional(&mut stream, &mut tunnel).await;
+                                let _ = crate::dataplane::mux::relay_bidirectional(
+                                    &mut stream,
+                                    &mut tunnel,
+                                )
+                                .await;
                             }
                             Err(e) => {
                                 tracing::error!("Failed to tunnel TCP connection to {}: {:?}", authority, e);

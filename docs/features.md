@@ -36,7 +36,7 @@ Unlike legacy VPNs that create separate point-to-point tunnels, Cisco Secure Acc
 - **mTLS Connection Pooling:** Maintains a multiplexed connection pool to the assigned Cisco cloud proxy (`proxy-<org_id>.zpc.sse.cisco.com:443`).
 - **TCP Stream Tunneling:** Tunnels TCP flows using standard HTTP/2 `CONNECT` streams.
 - **UDP Datagram Tunneling (MASQUE):** Tunnels UDP flows (e.g., Kerberos KDC on port 88, internal NTP/SNMP) using Extended `CONNECT` (`CONNECT-UDP`) per RFC 8441 and RFC 9298 MASQUE, packaging datagrams in RFC 9297 `DATAGRAM` capsules.
-- **Active Keepalive:** Runs a background 30-second HTTP/2 `PING` keepalive task to maintain persistent connection health and prevent NAT timeout drops.
+- **Active Connection & Per-Stream Keepalive:** Runs a background 30-second HTTP/2 `PING` keepalive task for the outer connection and sends 0-byte HTTP/2 `DATA` frames every 28 seconds on idle `H2TunnelStream`s so Cisco ZPC Envoy proxies reset their per-stream `stream_idle_timeout` even when OS TCP keep-alives are terminated locally by the TUN netstack. Automatically reconnects and retries once if a cached HTTP/2 connection resets when opening a new stream.
 - **Optimized Window Sizes:** Configured with elevated initial stream and connection windows (`1 MiB` stream / `4 MiB` connection) and instantaneous capacity release (`flow_control().release_capacity()`) on frame consumption to eliminate flow stalls on high-throughput transfers.
 - **Flow Posture Injection:** Enforces Cisco cloud security requirements by injecting `x-acidex-*` posture headers into each established stream.
 

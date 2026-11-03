@@ -243,7 +243,11 @@ When running with full system privileges on Linux (root / `CAP_NET_ADMIN`) or Wi
 
 All corporate traffic is multiplexed across an mTLS HTTP/2 connection to the assigned Cisco Secure Access proxy (`proxy-<org_id>.zpc.sse.cisco.com:443`):
 
-- **Connection Management:** Maintains an active HTTP/2 connection pool with proactive 30-second keepalive PING frames to prevent cloud NAT timeouts.
+- **Connection Management & Per-Stream Keepalive:**
+  - Maintains an active HTTP/2 connection pool with `TCP_NODELAY` enabled on the outer socket and proactive 30-second connection-level `PING` frames (`Stream ID = 0`) to prevent cloud NAT timeouts.
+  - Because `netstack-smoltcp` terminates OS-level TCP keep-alive probes locally on the TUN interface, individual `H2TunnelStream` instances (`Stream ID > 0`) emit a 0-byte HTTP/2 `DATA` frame every 28 seconds when idle (`STREAM_KEEPALIVE_INTERVAL`). This resets the Cisco ZPC Envoy proxy's per-stream `stream_idle_timeout` without injecting payload bytes into the application TCP stream (critical for long-lived database sessions such as MS SQL Server / JDBC in DBeaver).
+  - If a cached HTTP/2 `SendRequest` handle encounters an I/O reset or `GOAWAY` when opening a new `CONNECT` or `CONNECT-UDP` stream, `Http2MuxTransport` automatically invalidates the stale handle, establishes a fresh mTLS HTTP/2 connection, and retries the request once.
+  - Tunnel relaying (`relay_bidirectional`) bounds half-close drain to 5 seconds (`HALF_CLOSE_TIMEOUT`) so that local sockets left in `CLOSE-WAIT` do not hang `netstack-smoltcp` shutdown or leak HTTP/2 streams.
 - **Window Management & Flow Control:**
   - Initial connection window size: `4 MiB`.
   - Initial stream window size: `1 MiB`.

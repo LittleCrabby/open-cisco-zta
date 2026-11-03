@@ -58,6 +58,8 @@ impl Socks5Server {
         router: Arc<RouteMatcher>,
         mux: Arc<Http2MuxTransport>,
     ) -> Result<()> {
+        let _ = stream.set_nodelay(true);
+
         // Peek or read initial byte to determine protocol: SOCKS5 (0x05) or HTTP CONNECT ('C' / 'P')
         let mut first_byte = [0u8; 1];
         stream.read_exact(&mut first_byte).await?;
@@ -149,7 +151,7 @@ impl Socks5Server {
                     Ok(mut tunnel) => {
                         // SOCKS5 Success response
                         stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-                        let _ = tokio::io::copy_bidirectional(&mut stream, &mut tunnel).await;
+                        let _ = crate::dataplane::mux::relay_bidirectional(&mut stream, &mut tunnel).await;
                     }
                     Err(e) => {
                         tracing::error!("Failed to open ZTNA tunnel for {}: {:?}", authority, e);
@@ -160,6 +162,7 @@ impl Socks5Server {
                 // Direct connection
                 match TcpStream::connect(&authority).await {
                     Ok(mut direct) => {
+                        let _ = direct.set_nodelay(true);
                         stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
                         let _ = tokio::io::copy_bidirectional(&mut stream, &mut direct).await;
                     }
