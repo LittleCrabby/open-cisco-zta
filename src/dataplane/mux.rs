@@ -5,15 +5,169 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use http::{HeaderMap, Method, Request, Version};
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock};
+use tokio::task::AbortHandle;
+
+/// Maximum time to establish a new TCP + mTLS + HTTP/2 connection to the Cisco ZPC proxy.
+const H2_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Maximum time to wait for `h2::client::SendRequest::ready()` on a cached connection.
+const H2_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum time to wait for an HTTP/2 `CONNECT` or `CONNECT-UDP` response header from the proxy.
+const H2_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Interval between HTTP/2 `PING` keepalive frames on the multiplex connection.
+const H2_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Maximum time to wait for an HTTP/2 `PONG` response before declaring the connection dead.
+const H2_PING_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum wall-clock age since the last verified HTTP/2 `PONG` (or connection creation).
+/// Because `CLOCK_MONOTONIC` (`tokio::time::Instant`) pauses while the OS is suspended (`s2idle`/`S3`),
+/// checking `SystemTime` age immediately detects connections that went stale across system sleep.
+const H2_MAX_PONG_AGE: Duration = Duration::from_secs(75);
+
+struct CachedH2Client {
+    conn_id: u64,
+    client: h2::client::SendRequest<Bytes>,
+    local_ip: Option<IpAddr>,
+    peer_addr: Option<SocketAddr>,
+    last_pong_wall: Arc<std::sync::Mutex<SystemTime>>,
+    driver_abort: AbortHandle,
+    ping_abort: Option<AbortHandle>,
+}
+
+impl CachedH2Client {
+    /// Performs a zero-cost (non-network) viability check on the cached HTTP/2 connection:
+    /// 1. Verifies that the OS routing table still selects the same local source IP to reach
+    ///    `peer_addr` (instantly catches DHCP lease changes, Wi-Fi roaming, or interface switches).
+    /// 2. Verifies that wall-clock time (`SystemTime`) since the last HTTP/2 `PONG` has not
+    ///    exceeded `H2_MAX_PONG_AGE` (instantly catches system suspend/resume where `CLOCK_MONOTONIC`
+    ///    froze while the remote proxy or NAT closed the idle connection).
+    fn check_viability(&self) -> std::result::Result<(), String> {
+        if let (Some(bound_ip), Some(peer)) = (self.local_ip, self.peer_addr) {
+            if !bound_ip.is_loopback() && !peer.ip().is_loopback() {
+                match current_route_local_ip(peer) {
+                    Some(current_ip) if current_ip != bound_ip => {
+                        return Err(format!(
+                            "local source IP for proxy route changed ({} -> {})",
+                            bound_ip, current_ip
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "no active OS route to proxy peer {}",
+                            peer
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let Ok(last_pong) = self.last_pong_wall.lock() {
+            if let Ok(elapsed) = SystemTime::now().duration_since(*last_pong) {
+                if elapsed > H2_MAX_PONG_AGE {
+                    return Err(format!(
+                        "last H2 PONG was {:?} ago (exceeds {:?}; system resume from sleep or stalled link)",
+                        elapsed, H2_MAX_PONG_AGE
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for CachedH2Client {
+    fn drop(&mut self) {
+        self.driver_abort.abort();
+        if let Some(ref ping) = self.ping_abort {
+            ping.abort();
+        }
+    }
+}
+
+/// Queries the kernel routing table (via an unconnected UDP socket `connect` syscall, which sends
+/// zero packets on the wire) to determine the current preferred local source IP for `peer_addr`.
+fn current_route_local_ip(peer_addr: SocketAddr) -> Option<IpAddr> {
+    let bind_addr: SocketAddr = if peer_addr.is_ipv4() {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    } else {
+        SocketAddr::from(([0u16; 8], 0))
+    };
+    let sock = std::net::UdpSocket::bind(bind_addr).ok()?;
+    sock.connect(peer_addr).ok()?;
+    Some(sock.local_addr().ok()?.ip())
+}
+
+/// Configures kernel-level TCP keepalive and `TCP_USER_TIMEOUT` on the proxy socket so the OS
+/// aborts unacknowledged transmissions in ~15 seconds instead of ~16 minutes (`tcp_retries2 = 15`).
+#[cfg(target_os = "linux")]
+pub(crate) fn configure_proxy_tcp_socket(tcp: &TcpStream) {
+    use std::os::unix::io::AsRawFd;
+    let fd = tcp.as_raw_fd();
+    unsafe {
+        let user_timeout_ms: libc::c_uint = 15_000;
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_USER_TIMEOUT,
+            &user_timeout_ms as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&user_timeout_ms) as libc::socklen_t,
+        );
+
+        let keepalive: libc::c_int = 1;
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            &keepalive as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&keepalive) as libc::socklen_t,
+        );
+
+        let keepidle: libc::c_int = 30;
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPIDLE,
+            &keepidle as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&keepidle) as libc::socklen_t,
+        );
+
+        let keepintvl: libc::c_int = 10;
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            &keepintvl as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&keepintvl) as libc::socklen_t,
+        );
+
+        let keepcnt: libc::c_int = 3;
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPCNT,
+            &keepcnt as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&keepcnt) as libc::socklen_t,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn configure_proxy_tcp_socket(_tcp: &TcpStream) {}
 
 pub struct Http2MuxTransport {
     proxy_host: String,
@@ -21,8 +175,10 @@ pub struct Http2MuxTransport {
     cert_path: Option<PathBuf>,
     key_path: Option<PathBuf>,
     flow_provider: Arc<dyn FlowMetadataProvider>,
-    send_request: Arc<RwLock<Option<h2::client::SendRequest<Bytes>>>>,
+    cached_client: Arc<RwLock<Option<CachedH2Client>>>,
     connecting_lock: Arc<Mutex<()>>,
+    next_conn_id: AtomicU64,
+    connect_timeout: Duration,
 }
 
 impl Http2MuxTransport {
@@ -40,34 +196,71 @@ impl Http2MuxTransport {
             key_path,
             flow_provider: flow_provider
                 .unwrap_or_else(|| Arc::new(DefaultAcidexProvider::new())),
-            send_request: Arc::new(RwLock::new(None)),
+            cached_client: Arc::new(RwLock::new(None)),
             connecting_lock: Arc::new(Mutex::new(())),
+            next_conn_id: AtomicU64::new(1),
+            connect_timeout: H2_CONNECT_TIMEOUT,
         }
     }
 
-    async fn get_or_create_client(&self) -> Result<h2::client::SendRequest<Bytes>> {
-        {
-            let guard = self.send_request.read().await;
-            if let Some(ref client) = *guard {
-                if let Ok(ready) = client.clone().ready().await {
-                    return Ok(ready);
-                }
+    async fn try_get_viable_client(&self) -> Option<(u64, h2::client::SendRequest<Bytes>)> {
+        let (conn_id, client, viability_err) = {
+            let guard = self.cached_client.read().await;
+            let cached = guard.as_ref()?;
+            (
+                cached.conn_id,
+                cached.client.clone(),
+                cached.check_viability().err(),
+            )
+        };
+
+        if let Some(reason) = viability_err {
+            tracing::warn!(
+                "Invalidating stale H2 connection #{}: {}",
+                conn_id,
+                reason
+            );
+            self.invalidate_client(conn_id).await;
+            return None;
+        }
+
+        match tokio::time::timeout(H2_READY_TIMEOUT, client.ready()).await {
+            Ok(Ok(ready)) => Some((conn_id, ready)),
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    "Cached H2 connection #{} no longer ready ({:?}); invalidating",
+                    conn_id,
+                    e
+                );
+                self.invalidate_client(conn_id).await;
+                None
             }
+            Err(_) => {
+                tracing::warn!(
+                    "Timed out waiting for H2 connection #{} ready(); invalidating",
+                    conn_id
+                );
+                self.invalidate_client(conn_id).await;
+                None
+            }
+        }
+    }
+
+    async fn get_or_create_client(&self) -> Result<(u64, h2::client::SendRequest<Bytes>)> {
+        if let Some(pair) = self.try_get_viable_client().await {
+            return Ok(pair);
         }
 
         let _guard = self.connecting_lock.lock().await;
-        // Double check after lock
-        {
-            let guard = self.send_request.read().await;
-            if let Some(ref client) = *guard {
-                if let Ok(ready) = client.clone().ready().await {
-                    return Ok(ready);
-                }
-            }
+        // Double check after acquiring connecting_lock
+        if let Some(pair) = self.try_get_viable_client().await {
+            return Ok(pair);
         }
 
+        let conn_id = self.next_conn_id.fetch_add(1, Ordering::SeqCst);
         tracing::info!(
-            "Establishing new mTLS HTTP/2 connection to {}:{}",
+            "Establishing new mTLS HTTP/2 connection #{} to {}:{}",
+            conn_id,
             self.proxy_host,
             self.proxy_port
         );
@@ -77,64 +270,139 @@ impl Http2MuxTransport {
         let tls_cfg = TlsConfig::for_h2(cert_opt, key_opt);
         let connector = create_ssl_connector(&tls_cfg)?;
 
-        let tcp = TcpStream::connect((self.proxy_host.as_str(), self.proxy_port))
-            .await
-            .with_context(|| format!("Failed to connect TCP to {}:{}", self.proxy_host, self.proxy_port))?;
-        if let Err(e) = tcp.set_nodelay(true) {
-            tracing::debug!("Failed to set TCP_NODELAY on proxy connection: {:?}", e);
-        }
+        let proxy_host = self.proxy_host.clone();
+        let proxy_port = self.proxy_port;
 
-        let ssl = connector
-            .configure()?
-            .into_ssl(&self.proxy_host)
-            .context("Failed to configure SSL for proxy")?;
+        let (client, mut h2_conn, local_ip, peer_addr) =
+            tokio::time::timeout(H2_HANDSHAKE_TIMEOUT, async move {
+                let tcp = TcpStream::connect((proxy_host.as_str(), proxy_port))
+                    .await
+                    .with_context(|| {
+                        format!("Failed to connect TCP to {}:{}", proxy_host, proxy_port)
+                    })?;
+                if let Err(e) = tcp.set_nodelay(true) {
+                    tracing::debug!("Failed to set TCP_NODELAY on proxy connection: {:?}", e);
+                }
+                configure_proxy_tcp_socket(&tcp);
 
-        let mut tls_stream = tokio_openssl::SslStream::new(ssl, tcp)?;
-        Pin::new(&mut tls_stream)
-            .connect()
-            .await
-            .context("mTLS handshake failed with Cisco proxy")?;
+                let local_ip = tcp.local_addr().ok().map(|a| a.ip());
+                let peer_addr = tcp.peer_addr().ok();
 
-        let (client, mut h2_conn) = h2::client::Builder::new()
-            .initial_window_size(1024 * 1024)
-            .initial_connection_window_size(4 * 1024 * 1024)
-            .handshake(tls_stream)
+                let ssl = connector
+                    .configure()?
+                    .into_ssl(&proxy_host)
+                    .context("Failed to configure SSL for proxy")?;
+
+                let mut tls_stream = tokio_openssl::SslStream::new(ssl, tcp)?;
+                Pin::new(&mut tls_stream)
+                    .connect()
+                    .await
+                    .context("mTLS handshake failed with Cisco proxy")?;
+
+                let (client, h2_conn) = h2::client::Builder::new()
+                    .initial_window_size(1024 * 1024)
+                    .initial_connection_window_size(4 * 1024 * 1024)
+                    .handshake(tls_stream)
+                    .await
+                    .context("HTTP/2 handshake failed with Cisco proxy")?;
+
+                Ok::<_, anyhow::Error>((client, h2_conn, local_ip, peer_addr))
+            })
             .await
-            .context("HTTP/2 handshake failed with Cisco proxy")?;
+            .with_context(|| {
+                format!(
+                    "Timed out ({:?}) establishing mTLS HTTP/2 connection to {}:{}",
+                    H2_HANDSHAKE_TIMEOUT, self.proxy_host, self.proxy_port
+                )
+            })??;
 
         let ping_pong_opt = h2_conn.ping_pong();
+        let last_pong_wall = Arc::new(std::sync::Mutex::new(SystemTime::now()));
 
         // Spawn connection driver task
-        tokio::spawn(async move {
+        let cached_for_driver = Arc::clone(&self.cached_client);
+        let driver_task = tokio::spawn(async move {
             if let Err(e) = h2_conn.await {
-                tracing::debug!("H2 connection driver ended: {:?}", e);
+                tracing::debug!("H2 connection #{} driver ended: {:?}", conn_id, e);
+            }
+            let mut w = cached_for_driver.write().await;
+            if w.as_ref().is_some_and(|c| c.conn_id == conn_id) {
+                *w = None;
             }
         });
+        let driver_abort = driver_task.abort_handle();
 
-        // Spawn PING keepalive task
-        if let Some(mut ping_pong) = ping_pong_opt {
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(30));
+        // Spawn PING keepalive task with timeout and automatic stale-connection invalidation
+        let ping_abort = if let Some(mut ping_pong) = ping_pong_opt {
+            let cached_for_ping = Arc::clone(&self.cached_client);
+            let last_pong_for_ping = Arc::clone(&last_pong_wall);
+            let ping_task = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(H2_PING_INTERVAL);
                 interval.tick().await; // first tick is immediate
                 loop {
                     interval.tick().await;
                     let ping = h2::Ping::opaque();
-                    if let Err(e) = ping_pong.ping(ping).await {
-                        tracing::debug!("H2 PING error (connection likely closed): {:?}", e);
-                        break;
+                    match tokio::time::timeout(H2_PING_TIMEOUT, ping_pong.ping(ping)).await {
+                        Ok(Ok(_pong)) => {
+                            if let Ok(mut ts) = last_pong_for_ping.lock() {
+                                *ts = SystemTime::now();
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                "H2 PING error on connection #{} ({:?}); invalidating connection",
+                                conn_id,
+                                e
+                            );
+                            let mut w = cached_for_ping.write().await;
+                            if w.as_ref().is_some_and(|c| c.conn_id == conn_id) {
+                                *w = None;
+                            }
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "H2 PING keepalive timed out after {:?} on connection #{}; invalidating dead connection",
+                                H2_PING_TIMEOUT,
+                                conn_id
+                            );
+                            let mut w = cached_for_ping.write().await;
+                            if w.as_ref().is_some_and(|c| c.conn_id == conn_id) {
+                                *w = None;
+                            }
+                            break;
+                        }
                     }
                 }
             });
-        }
+            Some(ping_task.abort_handle())
+        } else {
+            None
+        };
 
-        let mut w = self.send_request.write().await;
-        *w = Some(client.clone());
-        Ok(client)
+        let ready_client = tokio::time::timeout(H2_READY_TIMEOUT, client.clone().ready())
+            .await
+            .context("Timed out waiting for newly established H2 client ready()")?
+            .context("Newly established H2 client failed ready()")?;
+
+        let mut w = self.cached_client.write().await;
+        *w = Some(CachedH2Client {
+            conn_id,
+            client,
+            local_ip,
+            peer_addr,
+            last_pong_wall,
+            driver_abort,
+            ping_abort,
+        });
+        Ok((conn_id, ready_client))
     }
 
-    async fn invalidate_client(&self) {
-        let mut w = self.send_request.write().await;
-        *w = None;
+    async fn invalidate_client(&self, conn_id: u64) {
+        let mut w = self.cached_client.write().await;
+        if w.as_ref().is_some_and(|c| c.conn_id == conn_id) {
+            *w = None;
+        }
     }
 
     pub async fn open_tcp_tunnel(
@@ -158,22 +426,7 @@ impl Http2MuxTransport {
         self.flow_provider.append_headers(&flow_info, &mut headers);
 
         for attempt in 0..2 {
-            let client = self.get_or_create_client().await?;
-            let mut ready_client = match client.ready().await {
-                Ok(c) => c,
-                Err(e) => {
-                    self.invalidate_client().await;
-                    if attempt == 0 {
-                        tracing::warn!(
-                            "Cached H2 client not ready for {} ({:?}); reconnecting and retrying",
-                            authority,
-                            e
-                        );
-                        continue;
-                    }
-                    bail!("H2 client not ready: {:?}", e);
-                }
-            };
+            let (conn_id, mut ready_client) = self.get_or_create_client().await?;
 
             let mut req = Request::builder()
                 .method(Method::CONNECT)
@@ -189,10 +442,11 @@ impl Http2MuxTransport {
             let (response_future, send_stream) = match ready_client.send_request(request, false) {
                 Ok(pair) => pair,
                 Err(e) => {
-                    self.invalidate_client().await;
+                    self.invalidate_client(conn_id).await;
                     if attempt == 0 {
                         tracing::warn!(
-                            "Failed to send CONNECT on cached H2 connection for {} ({:?}); reconnecting and retrying",
+                            "Failed to send CONNECT on cached H2 connection #{} for {} ({:?}); reconnecting and retrying",
+                            conn_id,
                             authority,
                             e
                         );
@@ -202,14 +456,15 @@ impl Http2MuxTransport {
                 }
             };
 
-            let response = match response_future.await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    if e.is_io() || e.is_go_away() || e.is_library() {
-                        self.invalidate_client().await;
+            let response = match tokio::time::timeout(self.connect_timeout, response_future).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => {
+                    if e.is_io() || e.is_go_away() || e.is_library() || e.is_remote() {
+                        self.invalidate_client(conn_id).await;
                         if attempt == 0 {
                             tracing::warn!(
-                                "H2 connection error awaiting CONNECT response for {} ({:?}); reconnecting and retrying",
+                                "H2 connection #{} error awaiting CONNECT response for {} ({:?}); reconnecting and retrying",
+                                conn_id,
                                 authority,
                                 e
                             );
@@ -217,6 +472,23 @@ impl Http2MuxTransport {
                         }
                     }
                     bail!("CONNECT response error: {:?}", e);
+                }
+                Err(_) => {
+                    self.invalidate_client(conn_id).await;
+                    if attempt == 0 {
+                        tracing::warn!(
+                            "Timed out ({:?}) awaiting HTTP/2 CONNECT response for {} on connection #{}; reconnecting and retrying",
+                            self.connect_timeout,
+                            authority,
+                            conn_id
+                        );
+                        continue;
+                    }
+                    bail!(
+                        "Timed out ({:?}) awaiting HTTP/2 CONNECT response for {}",
+                        self.connect_timeout,
+                        authority
+                    );
                 }
             };
 
@@ -265,22 +537,7 @@ impl Http2MuxTransport {
         self.flow_provider.append_headers(&flow_info, &mut headers);
 
         for attempt in 0..2 {
-            let client = self.get_or_create_client().await?;
-            let mut ready_client = match client.ready().await {
-                Ok(c) => c,
-                Err(e) => {
-                    self.invalidate_client().await;
-                    if attempt == 0 {
-                        tracing::warn!(
-                            "Cached H2 client not ready for UDP {} ({:?}); reconnecting and retrying",
-                            authority,
-                            e
-                        );
-                        continue;
-                    }
-                    bail!("H2 client not ready: {:?}", e);
-                }
-            };
+            let (conn_id, mut ready_client) = self.get_or_create_client().await?;
 
             let mut req = Request::builder()
                 .method(Method::CONNECT)
@@ -305,10 +562,11 @@ impl Http2MuxTransport {
             let (response_future, send_stream) = match ready_client.send_request(request, false) {
                 Ok(pair) => pair,
                 Err(e) => {
-                    self.invalidate_client().await;
+                    self.invalidate_client(conn_id).await;
                     if attempt == 0 {
                         tracing::warn!(
-                            "Failed to send CONNECT-UDP on cached H2 connection for {} ({:?}); reconnecting and retrying",
+                            "Failed to send CONNECT-UDP on cached H2 connection #{} for {} ({:?}); reconnecting and retrying",
+                            conn_id,
                             authority,
                             e
                         );
@@ -318,14 +576,15 @@ impl Http2MuxTransport {
                 }
             };
 
-            let response = match response_future.await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    if e.is_io() || e.is_go_away() || e.is_library() {
-                        self.invalidate_client().await;
+            let response = match tokio::time::timeout(self.connect_timeout, response_future).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => {
+                    if e.is_io() || e.is_go_away() || e.is_library() || e.is_remote() {
+                        self.invalidate_client(conn_id).await;
                         if attempt == 0 {
                             tracing::warn!(
-                                "H2 connection error awaiting CONNECT-UDP response for {} ({:?}); reconnecting and retrying",
+                                "H2 connection #{} error awaiting CONNECT-UDP response for {} ({:?}); reconnecting and retrying",
+                                conn_id,
                                 authority,
                                 e
                             );
@@ -333,6 +592,23 @@ impl Http2MuxTransport {
                         }
                     }
                     bail!("CONNECT-UDP response error: {:?}", e);
+                }
+                Err(_) => {
+                    self.invalidate_client(conn_id).await;
+                    if attempt == 0 {
+                        tracing::warn!(
+                            "Timed out ({:?}) awaiting HTTP/2 CONNECT-UDP response for {} on connection #{}; reconnecting and retrying",
+                            self.connect_timeout,
+                            authority,
+                            conn_id
+                        );
+                        continue;
+                    }
+                    bail!(
+                        "Timed out ({:?}) awaiting HTTP/2 CONNECT-UDP response for {}",
+                        self.connect_timeout,
+                        authority
+                    );
                 }
             };
 
@@ -1020,5 +1296,74 @@ mod tests {
         .unwrap();
         assert_eq!(ab, 0);
         assert_eq!(ba, b"server greeting".len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_cached_h2_client_detects_sleep_and_aborts_stuck_connect() {
+        let (client_io, _blackholed_server_io) = tokio::io::duplex(64 * 1024);
+        let (server_wire, server_io) = tokio::io::duplex(64 * 1024);
+
+        // Perform a real H2 handshake first, then stop reading from server_io to simulate a post-sleep blackhole
+        let handshake_bridge = tokio::spawn(async move {
+            let server = h2::server::handshake(server_io).await.unwrap();
+            // Keep server alive without answering any CONNECT requests (simulating blackhole)
+            std::future::pending::<()>().await;
+            drop(server);
+        });
+
+        let (mut c_a, mut c_b) = tokio::io::split(client_io);
+        let (mut s_a, mut s_b) = tokio::io::split(server_wire);
+        let bridge_task = tokio::spawn(async move {
+            let _ = tokio::join!(
+                tokio::io::copy(&mut c_a, &mut s_b),
+                tokio::io::copy(&mut s_a, &mut c_b)
+            );
+        });
+
+        let (client, h2_conn) = h2::client::handshake( _blackholed_server_io ).await.unwrap();
+        let driver_task = tokio::spawn(async move {
+            let _ = h2_conn.await;
+        });
+
+        let last_pong_wall = Arc::new(std::sync::Mutex::new(SystemTime::now()));
+        let cached = CachedH2Client {
+            conn_id: 1,
+            client: client.clone(),
+            local_ip: None,
+            peer_addr: None,
+            last_pong_wall: Arc::clone(&last_pong_wall),
+            driver_abort: driver_task.abort_handle(),
+            ping_abort: Some(bridge_task.abort_handle()),
+        };
+
+        // Initially viable
+        assert!(cached.check_viability().is_ok());
+
+        // Simulate system resume from sleep (wall-clock advanced beyond H2_MAX_PONG_AGE)
+        *last_pong_wall.lock().unwrap() = SystemTime::now() - (H2_MAX_PONG_AGE + Duration::from_secs(10));
+        let err_msg = cached.check_viability().unwrap_err();
+        assert!(err_msg.contains("last H2 PONG was"), "Unexpected error: {}", err_msg);
+
+        // Queue a CONNECT request on the blackholed connection
+        let mut ready = client.clone().ready().await.unwrap();
+        let req = Request::builder()
+            .method(Method::CONNECT)
+            .uri("gitlab.vstbank.ua:443")
+            .body(())
+            .unwrap();
+        let (resp_fut, _send_stream) = ready.send_request(req, false).unwrap();
+
+        // Dropping CachedH2Client (on invalidation) must abort the driver task immediately,
+        // causing in-flight `resp_fut` to resolve with an error right away instead of hanging.
+        drop(cached);
+        drop(ready);
+        drop(client);
+
+        let res = tokio::time::timeout(Duration::from_millis(200), resp_fut)
+            .await
+            .expect("resp_fut should fail immediately when driver is aborted");
+        assert!(res.is_err());
+
+        handshake_bridge.abort();
     }
 }

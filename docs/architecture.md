@@ -243,10 +243,13 @@ When running with full system privileges on Linux (root / `CAP_NET_ADMIN`) or Wi
 
 All corporate traffic is multiplexed across an mTLS HTTP/2 connection to the assigned Cisco Secure Access proxy (`proxy-<org_id>.zpc.sse.cisco.com:443`):
 
-- **Connection Management & Per-Stream Keepalive:**
-  - Maintains an active HTTP/2 connection pool with `TCP_NODELAY` enabled on the outer socket and proactive 30-second connection-level `PING` frames (`Stream ID = 0`) to prevent cloud NAT timeouts.
+- **Connection Management, Suspend/Resume Recovery & Per-Stream Keepalive:**
+  - Maintains an active HTTP/2 connection (`CachedH2Client`) with `TCP_NODELAY`, Linux kernel `TCP_USER_TIMEOUT` (`15s`) and `SO_KEEPALIVE`, and proactive 30-second connection-level `PING` frames (`Stream ID = 0`, bounded by a `10s` `PONG` timeout) to prevent cloud NAT timeouts and detect dead links.
+  - **Zero-Latency Sleep & Network Change Detection:** Before reusing a cached HTTP/2 connection, `Http2MuxTransport` performs a non-blocking pre-flight viability check (`CachedH2Client::check_viability`):
+    1. **Route Source-IP Verification:** Queries the OS routing table via an unbound UDP socket (`connect` + `local_addr`, zero wire packets) to verify that the local source IP used to reach the proxy matches the cached TCP socket's local IP (instantly catching Wi-Fi DHCP lease changes or interface roaming).
+    2. **Wall-Clock `PONG` Age Check:** Compares `SystemTime::now()` against the timestamp of the last received HTTP/2 `PONG` (`H2_MAX_PONG_AGE = 75s`), immediately catching system suspend/resume (`s2idle`/`S3`) where `CLOCK_MONOTONIC` (`tokio::time::Instant`) was frozen while the remote proxy or NAT dropped the connection.
+  - **Bounded Handshake & Stream Timeouts with Driver Abort:** Outer TCP/mTLS/HTTP/2 handshakes (`15s`) and `CONNECT` / `CONNECT-UDP` response headers (`10s`) are strictly bounded. When a connection is invalidated (by pre-flight check, `PING` timeout, or `CONNECT` error/timeout), dropping `CachedH2Client` immediately aborts the background `h2` driver task, closing the underlying OS TCP socket and waking any other in-flight streams so they can retry on the new connection generation.
   - Because `netstack-smoltcp` terminates OS-level TCP keep-alive probes locally on the TUN interface, individual `H2TunnelStream` instances (`Stream ID > 0`) emit a 0-byte HTTP/2 `DATA` frame every 28 seconds when idle (`STREAM_KEEPALIVE_INTERVAL`). This resets the Cisco ZPC Envoy proxy's per-stream `stream_idle_timeout` without injecting payload bytes into the application TCP stream (critical for long-lived database sessions such as MS SQL Server / JDBC in DBeaver).
-  - If a cached HTTP/2 `SendRequest` handle encounters an I/O reset or `GOAWAY` when opening a new `CONNECT` or `CONNECT-UDP` stream, `Http2MuxTransport` automatically invalidates the stale handle, establishes a fresh mTLS HTTP/2 connection, and retries the request once.
   - Tunnel relaying (`relay_bidirectional`) bounds half-close drain to 5 seconds (`HALF_CLOSE_TIMEOUT`) so that local sockets left in `CLOSE-WAIT` do not hang `netstack-smoltcp` shutdown or leak HTTP/2 streams.
 - **Window Management & Flow Control:**
   - Initial connection window size: `4 MiB`.

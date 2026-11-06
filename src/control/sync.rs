@@ -1,12 +1,16 @@
 use crate::config::{ConfigManager, ZtnaConfig, ZtnaConfigWrapper};
 use crate::crypto::{create_ssl_connector, TlsConfig};
+use crate::dataplane::mux::configure_proxy_tcp_socket;
 use crate::plugins::{AcidexPayload, OsProfile};
 use anyhow::{bail, Context, Result};
 use std::pin::Pin;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use url::Url;
 use uuid::Uuid;
+
+const CONFIG_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum SyncResult {
@@ -59,21 +63,6 @@ impl ConfigSync {
         let connector = create_ssl_connector(&tls_cfg)?;
 
         tracing::info!("Connecting to ConfigSync server {}:{} (mTLS)", host, port);
-        let tcp = TcpStream::connect((host, port))
-            .await
-            .with_context(|| format!("Failed to connect to {host}:{port}"))?;
-
-        let ssl = connector
-            .configure()?
-            .into_ssl(host)
-            .context("Failed to configure SSL for host")?;
-
-        let mut tls_stream = tokio_openssl::SslStream::new(ssl, tcp)?;
-        Pin::new(&mut tls_stream)
-            .connect()
-            .await
-            .context("TLS handshake failed during ConfigSync")?;
-
         let os_profile = self.os_profile_override.unwrap_or_else(|| {
             enrollment
                 .os_profile
@@ -112,13 +101,39 @@ impl ConfigSync {
         }
         req.push_str("\r\n");
 
-        tls_stream.write_all(req.as_bytes()).await?;
-        tls_stream.write_all(&body_bytes).await?;
-        tls_stream.flush().await?;
+        let response_bytes = tokio::time::timeout(CONFIG_SYNC_TIMEOUT, async {
+            let tcp = TcpStream::connect((host, port))
+                .await
+                .with_context(|| format!("Failed to connect to {host}:{port}"))?;
+            let _ = tcp.set_nodelay(true);
+            configure_proxy_tcp_socket(&tcp);
 
-        // Read response
-        let mut response_bytes = Vec::new();
-        tls_stream.read_to_end(&mut response_bytes).await?;
+            let ssl = connector
+                .configure()?
+                .into_ssl(host)
+                .context("Failed to configure SSL for host")?;
+
+            let mut tls_stream = tokio_openssl::SslStream::new(ssl, tcp)?;
+            Pin::new(&mut tls_stream)
+                .connect()
+                .await
+                .context("TLS handshake failed during ConfigSync")?;
+
+            tls_stream.write_all(req.as_bytes()).await?;
+            tls_stream.write_all(&body_bytes).await?;
+            tls_stream.flush().await?;
+
+            let mut buf = Vec::new();
+            tls_stream.read_to_end(&mut buf).await?;
+            Ok::<Vec<u8>, anyhow::Error>(buf)
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "Timed out ({:?}) during ConfigSync with {}:{}",
+                CONFIG_SYNC_TIMEOUT, host, port
+            )
+        })??;
 
         let parsed = parse_http1_response(&response_bytes)?;
         tracing::info!("ConfigSync response: {}", parsed.status_line);
