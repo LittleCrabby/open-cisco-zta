@@ -206,13 +206,13 @@ The Fake-IP engine allows transparent interception of corporate domain traffic w
 ### 3.2 Virtual TUN & Userspace Network Stack (`tun_device.rs`)
 
 When running with full system privileges on Linux (root / `CAP_NET_ADMIN`) or Windows (Administrator / SYSTEM with `wintun.dll` next to the executable):
-- Creates a virtual TUN device (`ztna0`, IP `100.64.0.1/32`, MTU 1500), backed by the kernel TUN driver on Linux or Wintun on Windows.
-- Backed by `netstack-smoltcp`, an asynchronous userspace TCP/IP stack.
+- Creates a virtual TUN device (`ztna0`, IP `100.64.0.1/255.255.255.0`, MTU 1400), backed by the kernel TUN driver on Linux or Wintun on Windows.
+- Backed by `netstack-smoltcp` for TCP and ICMP (`enable_tcp(true)`, `enable_icmp(true)`, `enable_udp(false)`), paired with a dedicated UDP ingress/egress pipeline and bounded IPv4 fragment reassembler (`Ipv4UdpReassembler`, 64 entries max, 5s expiration) so fragmented UDP packets exceeding the TUN MTU neither get dropped nor terminate the UDP stream (`netstack-smoltcp`'s built-in `udp::ReadHalf` returns `Poll::Ready(None)` on any fragmented IPv4 UDP packet).
 - Binds embedded Fake-IP DNS listeners on `127.0.0.1:53`, `<tun_ip>:53` (retrying up to 20 times at 500 ms intervals to accommodate asynchronous IP assignment by Windows Wintun), and `127.0.0.1:1053`.
 - Incoming packets on `ztna0` are processed in userspace:
   - DNS packets on port 53 are handled directly by the internal DNS engine.
   - TCP SYN packets establish userspace TCP streams. If the destination IP is in the Fake-IP pool, the original corporate FQDN is looked up and dialed over the HTTP/2 tunnel. If it matches a corporate CIDR, the IP:port is dialed directly.
-  - UDP datagrams are dispatched to UDP tunnel streams using RFC 9298 MASQUE.
+  - UDP datagrams (including multi-fragment IPv4 UDP datagrams such as compressed GZIP GelF logs or large Kerberos packets) are reassembled in userspace, dispatched to UDP tunnel streams using RFC 9298 MASQUE (`CONNECT-UDP`), and fragmented back to the TUN MTU on egress if needed.
 
 ### 3.3 System Routing & Split-DNS Manager (`sys_route.rs`)
 
