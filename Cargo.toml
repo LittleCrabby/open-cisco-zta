@@ -1,6 +1,6 @@
 [package]
 name = "open-cisco-zta"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 authors = ["LittleCrabby"]
 description = "High-performance alternative client for Cisco Secure Access ZTNA"
@@ -46,7 +46,6 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 bytes = "1"
 anyhow = "1.0"
-thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
@@ -55,7 +54,6 @@ openssl = "0.10"
 tokio-openssl = "0.6"
 p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 rcgen = "0.13"
-x509-parser = "0.16"
 sha2 = "0.10"
 base64 = "0.22"
 

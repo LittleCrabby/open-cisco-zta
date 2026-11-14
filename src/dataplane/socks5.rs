@@ -148,10 +148,12 @@ impl Socks5Server {
 
             if is_corporate {
                 match mux.open_tcp_tunnel(&authority, Some(peer_addr)).await {
-                    Ok(mut tunnel) => {
+                    Ok(tunnel) => {
                         // SOCKS5 Success response
                         stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-                        let _ = crate::dataplane::mux::relay_bidirectional(&mut stream, &mut tunnel).await;
+                        let _ = mux
+                            .relay_tcp_stream(&mut stream, tunnel, &authority, Some(peer_addr))
+                            .await;
                     }
                     Err(e) => {
                         tracing::error!("Failed to open ZTNA tunnel for {}: {:?}", authority, e);

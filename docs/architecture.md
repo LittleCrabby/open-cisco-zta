@@ -130,7 +130,7 @@ The `ConfigSync` service keeps corporate routing rules up-to-date:
 - Request Body: Serialized `AcidexPayload` JSON containing hardware and OS posture.
 - Response handling:
   - `304 Not Modified`: Cached policy is still fresh; no parsing needed.
-  - `200 OK`: Parses new `ZtnaConfigWrapper`, updates active `RouteMatcher`, and caches the new configuration and ETag to disk (`ztna_config.json`).
+  - `200 OK`: Parses new `ZtnaConfigWrapper`, caches the new configuration and ETag to disk (`ztna_config.json`), atomically swaps rules inside the shared `RouteMatcher` (`update_from_resource_configs`), reapplies kernel CIDR routes and Split-DNS domains in full-system mode, and adjusts the periodic sync interval if `Sync-Interval-Minute` changed.
 
 ### 1.4 System Checks & Pre-Flight Validations (`system_check.rs`)
 
@@ -239,7 +239,7 @@ When running with full system privileges on Linux (root / `CAP_NET_ADMIN`) or Wi
 
 ## 4. Data Plane & Multiplexing (`src/dataplane/`)
 
-### 4.1 HTTP/2 Multiplexed Transport (`mux.rs`)
+### 4.1 HTTP/2 Multiplexed Transport & Stream Modules (`mux.rs`, `stream.rs`, `masque.rs`, `relay.rs`)
 
 All corporate traffic is multiplexed across an mTLS HTTP/2 connection to the assigned Cisco Secure Access proxy (`proxy-<org_id>.zpc.sse.cisco.com:443`):
 
@@ -248,7 +248,8 @@ All corporate traffic is multiplexed across an mTLS HTTP/2 connection to the ass
   - **Zero-Latency Sleep & Network Change Detection:** Before reusing a cached HTTP/2 connection, `Http2MuxTransport` performs a non-blocking pre-flight viability check (`CachedH2Client::check_viability`):
     1. **Route Source-IP Verification:** Queries the OS routing table via an unbound UDP socket (`connect` + `local_addr`, zero wire packets) to verify that the local source IP used to reach the proxy matches the cached TCP socket's local IP (instantly catching Wi-Fi DHCP lease changes or interface roaming).
     2. **Wall-Clock `PONG` Age Check:** Compares `SystemTime::now()` against the timestamp of the last received HTTP/2 `PONG` (`H2_MAX_PONG_AGE = 75s`), immediately catching system suspend/resume (`s2idle`/`S3`) where `CLOCK_MONOTONIC` (`tokio::time::Instant`) was frozen while the remote proxy or NAT dropped the connection.
-  - **Bounded Handshake & Stream Timeouts with Driver Abort:** Outer TCP/mTLS/HTTP/2 handshakes (`15s`) and `CONNECT` / `CONNECT-UDP` response headers (`10s`) are strictly bounded. When a connection is invalidated (by pre-flight check, `PING` timeout, or `CONNECT` error/timeout), dropping `CachedH2Client` immediately aborts the background `h2` driver task, closing the underlying OS TCP socket and waking any other in-flight streams so they can retry on the new connection generation.
+  - **Bounded Handshake & Stream Timeouts with Driver Abort:** Outer TCP/mTLS/HTTP/2 handshakes (`15s`) and `CONNECT` / `CONNECT-UDP` response headers (`10s`) are strictly bounded across up to 3 attempts (`H2_MAX_CONNECT_ATTEMPTS = 3`). Transient upstream ZTA Connector gateway failures (`502 Bad Gateway`, `503 Service Unavailable`, `504 Gateway Timeout`) are automatically retried on a fresh HTTP/2 stream without tearing down the healthy outer mTLS connection. When a connection is invalidated (by pre-flight check, `PING` timeout, or transport `CONNECT` error/timeout), dropping `CachedH2Client` immediately aborts the background `h2` driver task, closing the underlying OS TCP socket and waking any other in-flight streams so they can retry on the new connection generation.
+  - **Degraded ZTA Connector Stream Replay (`relay_bidirectional_with_retry`):** When an on-premises ZTA Connector in a load-balanced Connector Group accepts an HTTP/2 `CONNECT` stream (`200 OK`) but subsequently closes the stream with 0 bytes (`EOF`) or blackholes the initial client handshake payload (e.g., MS SQL TDS Pre-Login, TLS ClientHello, or HTTP request) without returning a single server response byte within `2.5s` (`FIRST_RESPONSE_TIMEOUT`), `Http2MuxTransport::relay_tcp_stream` transparently opens a fresh HTTP/2 stream (up to 3 retries) and replays the buffered initial client bytes (`<= 16 KiB`) so applications never see premature connection resets or pre-login failures.
   - Because `netstack-smoltcp` terminates OS-level TCP keep-alive probes locally on the TUN interface, individual `H2TunnelStream` instances (`Stream ID > 0`) emit a 0-byte HTTP/2 `DATA` frame every 28 seconds when idle (`STREAM_KEEPALIVE_INTERVAL`). This resets the Cisco ZPC Envoy proxy's per-stream `stream_idle_timeout` without injecting payload bytes into the application TCP stream (critical for long-lived database sessions such as MS SQL Server / JDBC in DBeaver).
   - Tunnel relaying (`relay_bidirectional`) bounds half-close drain to 5 seconds (`HALF_CLOSE_TIMEOUT`) so that local sockets left in `CLOSE-WAIT` do not hang `netstack-smoltcp` shutdown or leak HTTP/2 streams.
 - **Window Management & Flow Control:**
@@ -365,9 +366,12 @@ open-cisco-zta/
 │   │   ├── dpop.rs           # RFC 9449 DPoP proof generator (ES256)
 │   │   └── mod.rs            # OpenSSL mTLS engine & certificate inspection
 │   ├── dataplane/            # Data plane tunneling and routing
-│   │   ├── mux.rs            # Http2MuxTransport (h2 connection pool, CONNECT, MASQUE)
-│   │   ├── router.rs         # CIDR and wildcard domain RouteMatcher
-│   │   └── socks5.rs         # Local SOCKS5h proxy server
+│   │   ├── masque.rs         # RFC 9297/9298 MASQUE DATAGRAM capsules & QUIC varint codec (H2UdpStream)
+│   │   ├── mux.rs            # Http2MuxTransport (h2 connection pool, CONNECT, CONNECT-UDP failover)
+│   │   ├── relay.rs          # Bidirectional stream relay with CLOSE-WAIT bound & initial handshake replay
+│   │   ├── router.rs         # CIDR and wildcard domain RouteMatcher (with live atomic policy updates)
+│   │   ├── socks5.rs         # Local SOCKS5h proxy server
+│   │   └── stream.rs         # H2TunnelStream (flow-control release & 28s 0-byte DATA keepalives)
 │   ├── net/                  # Network stack and routing
 │   │   ├── fakeip.rs         # Fake-IP pool (198.18.0.0/15) & micro-DNS server
 │   │   ├── sys_route.rs      # System route & Split-DNS manager (Linux systemd-resolved/ip, Windows NRPT/netsh)

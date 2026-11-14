@@ -8,7 +8,6 @@ use open_cisco_zta::dataplane::router::RouteMatcher;
 use open_cisco_zta::dataplane::socks5::Socks5Server;
 use open_cisco_zta::net::{DnsServer, FakeIpPool, SystemRouteManager, TunDevice};
 use open_cisco_zta::plugins::OsProfile;
-use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -317,6 +316,18 @@ async fn cmd_sync(mgr: &ConfigManager) -> Result<()> {
     }
 }
 
+fn split_dns_target(tun_ip: Ipv4Addr) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        tun_ip.to_string()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = tun_ip;
+        "127.0.0.1".to_string()
+    }
+}
+
 async fn wait_for_shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {
@@ -413,16 +424,24 @@ async fn cmd_run(
         }
     });
 
+    let tun_supported = cfg!(any(target_os = "linux", target_os = "windows"));
+    let effective_proxy_only = proxy_only || !tun_supported;
+
     // Spawn periodic ConfigSync background task
-    let sync_interval_mins = enrollment
+    let mut current_interval_mins = enrollment
         .config_sync_interval
         .as_deref()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(10)
         .max(1);
     let sync_base_dir = mgr.base_dir().to_path_buf();
+    let sync_router = Arc::clone(&router);
+    let sync_tun_name = tun_name.clone();
+    let sync_split_dns_ip = split_dns_target(tun_ip);
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(sync_interval_mins * 60));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            current_interval_mins * 60,
+        ));
         interval.tick().await; // first tick is immediate
         loop {
             interval.tick().await;
@@ -431,15 +450,56 @@ async fn cmd_run(
                 Some(profile),
             );
             match syncer.sync_once().await {
-                Ok(SyncResult::Updated { etag, new_config, .. }) => {
+                Ok(SyncResult::Updated {
+                    etag,
+                    interval: new_interval,
+                    new_config,
+                }) => {
                     tracing::info!(
                         "Periodic ConfigSync updated policy ({} resource configs, ETag: {})",
                         new_config.resource_configs.len(),
                         etag
                     );
+                    sync_router.update_from_resource_configs(&new_config.resource_configs);
+                    if !effective_proxy_only {
+                        let route_mgr = SystemRouteManager::new(&sync_tun_name);
+                        let _ = route_mgr.apply_routes(&sync_router.effective_included_cidrs());
+                        let _ = route_mgr.configure_split_dns(
+                            &sync_split_dns_ip,
+                            &sync_router.pruned_search_domains(),
+                        );
+                    }
+                    if let Some(new_mins) = new_interval {
+                        let clamped_mins = (new_mins as u64).max(1);
+                        if clamped_mins != current_interval_mins {
+                            tracing::info!(
+                                "Updating periodic ConfigSync interval from {} min to {} min",
+                                current_interval_mins,
+                                clamped_mins
+                            );
+                            current_interval_mins = clamped_mins;
+                            interval = tokio::time::interval(std::time::Duration::from_secs(
+                                current_interval_mins * 60,
+                            ));
+                            interval.tick().await;
+                        }
+                    }
                 }
-                Ok(SyncResult::NotModified { etag, .. }) => {
+                Ok(SyncResult::NotModified {
+                    etag,
+                    interval: new_interval,
+                }) => {
                     tracing::debug!("Periodic ConfigSync: 304 Not Modified (ETag: {})", etag);
+                    if let Some(new_mins) = new_interval {
+                        let clamped_mins = (new_mins as u64).max(1);
+                        if clamped_mins != current_interval_mins {
+                            current_interval_mins = clamped_mins;
+                            interval = tokio::time::interval(std::time::Duration::from_secs(
+                                current_interval_mins * 60,
+                            ));
+                            interval.tick().await;
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Periodic ConfigSync failed: {:?}", e);
@@ -472,9 +532,6 @@ async fn cmd_run(
             tracing::error!("SOCKS5 server terminated with error: {:?}", e);
         }
     });
-
-    let tun_supported = cfg!(any(target_os = "linux", target_os = "windows"));
-    let effective_proxy_only = proxy_only || !tun_supported;
 
     if !tun_supported && !proxy_only {
         println!("Note: Kernel TUN interface and system routes are currently supported on Linux and Windows.");
@@ -557,45 +614,14 @@ async fn cmd_run(
 
     // Step 3: Apply system routing and Split-DNS in systemd-resolved
     let route_mgr = SystemRouteManager::new(&tun_name);
-    let included_cidrs: Vec<_> = router
-        .cidr_includes
-        .iter()
-        .copied()
-        .filter(|inc| !router.cidr_excludes.iter().any(|exc| exc.contains(inc)))
-        .collect();
+    let included_cidrs = router.effective_included_cidrs();
     let _ = route_mgr.apply_routes(&included_cidrs);
 
-    // Build the minimal set of routing domains for systemd-resolved
-    let mut all_domains = BTreeSet::new();
-    for fqdn in &router.fqdn_includes {
-        let raw = match fqdn {
-            open_cisco_zta::dataplane::router::DomainPattern::Exact(e) => e.as_str(),
-            open_cisco_zta::dataplane::router::DomainPattern::Wildcard(w) => w.as_str(),
-        };
-        let clean = raw.trim_start_matches("*.").trim_end_matches('.').to_lowercase();
-        if !clean.is_empty() && router.matches_domain(&clean) {
-            all_domains.insert(clean);
-        }
-    }
-
-    // Prune redundant subdomains so systemd-resolved routing table stays clean and fast
-    let domain_list: Vec<String> = all_domains.into_iter().collect();
-    let mut search_domains = Vec::new();
-    for d in &domain_list {
-        let is_subdomain = domain_list
-            .iter()
-            .any(|other| other != d && d.ends_with(&format!(".{}", other)));
-        if !is_subdomain {
-            search_domains.push(d.clone());
-        }
-    }
+    let search_domains = router.pruned_search_domains();
 
     // Point systemd-resolved to 127.0.0.1 for instant, reliable resolution over loopback.
     // Windows NRPT rules need a routable resolver address, so use the TUN IP there.
-    #[cfg(target_os = "windows")]
-    let split_dns_ip = tun_ip.to_string();
-    #[cfg(not(target_os = "windows"))]
-    let split_dns_ip = "127.0.0.1".to_string();
+    let split_dns_ip = split_dns_target(tun_ip);
     let _ = route_mgr.configure_split_dns(&split_dns_ip, &search_domains);
 
     println!("Open Cisco ZTNA All-in-One is active!");

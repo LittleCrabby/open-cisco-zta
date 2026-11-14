@@ -1,7 +1,9 @@
 use crate::config::schema::ResourceConfig;
 use ipnet::IpNet;
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainPattern {
@@ -43,6 +45,7 @@ pub struct RouteMatcher {
     pub cidr_excludes: Vec<IpNet>,
     pub fqdn_includes: Vec<DomainPattern>,
     pub fqdn_excludes: Vec<DomainPattern>,
+    live_override: Arc<RwLock<Option<Arc<RouteMatcher>>>>,
 }
 
 impl RouteMatcher {
@@ -77,7 +80,20 @@ impl RouteMatcher {
         matcher
     }
 
+    /// Replaces the active routing rules atomically for all shared holders of this `RouteMatcher`.
+    pub fn update_from_resource_configs(&self, configs: &[ResourceConfig]) {
+        let new_matcher = Arc::new(Self::from_resource_configs(configs));
+        if let Ok(mut guard) = self.live_override.write() {
+            *guard = Some(new_matcher);
+        }
+    }
+
     pub fn matches_ip(&self, ip: IpAddr) -> bool {
+        if let Ok(guard) = self.live_override.read() {
+            if let Some(ref active) = *guard {
+                return active.matches_ip(ip);
+            }
+        }
         for exc in &self.cidr_excludes {
             if exc.contains(&ip) {
                 return false;
@@ -92,6 +108,11 @@ impl RouteMatcher {
     }
 
     pub fn matches_domain(&self, domain: &str) -> bool {
+        if let Ok(guard) = self.live_override.read() {
+            if let Some(ref active) = *guard {
+                return active.matches_domain(domain);
+            }
+        }
         for exc in &self.fqdn_excludes {
             if exc.matches(domain) {
                 return false;
@@ -106,6 +127,11 @@ impl RouteMatcher {
     }
 
     pub fn should_route(&self, host: &str, ip: Option<IpAddr>) -> bool {
+        if let Ok(guard) = self.live_override.read() {
+            if let Some(ref active) = *guard {
+                return active.should_route(host, ip);
+            }
+        }
         let clean_host = host.split(':').next().unwrap_or(host);
         if let Ok(parsed_ip) = clean_host.parse::<IpAddr>() {
             return self.matches_ip(parsed_ip);
@@ -122,11 +148,67 @@ impl RouteMatcher {
         false
     }
 
+    /// Returns included CIDRs not completely contained in any excluded CIDR.
+    pub fn effective_included_cidrs(&self) -> Vec<IpNet> {
+        if let Ok(guard) = self.live_override.read() {
+            if let Some(ref active) = *guard {
+                return active.effective_included_cidrs();
+            }
+        }
+        self.cidr_includes
+            .iter()
+            .copied()
+            .filter(|inc| !self.cidr_excludes.iter().any(|exc| exc.contains(inc)))
+            .collect()
+    }
+
+    /// Returns sorted, deduplicated corporate search domains with redundant subdomains pruned.
+    pub fn pruned_search_domains(&self) -> Vec<String> {
+        if let Ok(guard) = self.live_override.read() {
+            if let Some(ref active) = *guard {
+                return active.pruned_search_domains();
+            }
+        }
+        let mut all_domains = BTreeSet::new();
+        for fqdn in &self.fqdn_includes {
+            let raw = match fqdn {
+                DomainPattern::Exact(e) => e.as_str(),
+                DomainPattern::Wildcard(w) => w.as_str(),
+            };
+            let clean = raw.trim_start_matches("*.").trim_end_matches('.').to_lowercase();
+            if !clean.is_empty() && self.matches_domain(&clean) {
+                all_domains.insert(clean);
+            }
+        }
+
+        let domain_list: Vec<String> = all_domains.into_iter().collect();
+        let mut search_domains = Vec::new();
+        for d in &domain_list {
+            let is_subdomain = domain_list
+                .iter()
+                .any(|other| other != d && d.ends_with(&format!(".{}", other)));
+            if !is_subdomain {
+                search_domains.push(d.clone());
+            }
+        }
+        search_domains
+    }
+
     pub fn cidr_includes_count(&self) -> usize {
+        if let Ok(guard) = self.live_override.read() {
+            if let Some(ref active) = *guard {
+                return active.cidr_includes_count();
+            }
+        }
         self.cidr_includes.len()
     }
 
     pub fn fqdn_includes_count(&self) -> usize {
+        if let Ok(guard) = self.live_override.read() {
+            if let Some(ref active) = *guard {
+                return active.fqdn_includes_count();
+            }
+        }
         self.fqdn_includes.len()
     }
 }
@@ -189,5 +271,62 @@ mod tests {
 
         assert_eq!(matcher.cidr_includes_count(), 3);
         assert_eq!(matcher.fqdn_includes_count(), 2);
+    }
+
+    #[test]
+    fn test_route_matcher_live_update() {
+        let initial_configs = vec![ResourceConfig {
+            id: "res-1".to_string(),
+            label: None,
+            cidr: Some(CidrFilter {
+                include: vec!["10.0.0.0/8".to_string()],
+                exclude: vec![],
+            }),
+            fqdn: Some(FqdnFilter {
+                include: vec!["*.old.corp".to_string()],
+                exclude: vec![],
+            }),
+        }];
+
+        let matcher = Arc::new(RouteMatcher::from_resource_configs(&initial_configs));
+        let matcher_ref = Arc::clone(&matcher);
+
+        assert!(matcher_ref.matches_domain("app.old.corp"));
+        assert!(!matcher_ref.matches_domain("db.new.corp"));
+        assert!(matcher_ref.matches_ip("10.1.2.3".parse().unwrap()));
+        assert!(!matcher_ref.matches_ip("172.16.0.5".parse().unwrap()));
+
+        let updated_configs = vec![ResourceConfig {
+            id: "res-2".to_string(),
+            label: None,
+            cidr: Some(CidrFilter {
+                include: vec!["172.16.0.0/16".to_string(), "192.168.10.0/24".to_string()],
+                exclude: vec!["192.168.10.0/24".to_string()],
+            }),
+            fqdn: Some(FqdnFilter {
+                include: vec![
+                    "*.new.corp".to_string(),
+                    "sub.new.corp".to_string(),
+                    "portal.extra.corp".to_string(),
+                ],
+                exclude: vec![],
+            }),
+        }];
+
+        matcher.update_from_resource_configs(&updated_configs);
+
+        assert!(!matcher_ref.matches_domain("app.old.corp"));
+        assert!(matcher_ref.matches_domain("db.new.corp"));
+        assert!(!matcher_ref.matches_ip("10.1.2.3".parse().unwrap()));
+        assert!(matcher_ref.matches_ip("172.16.0.5".parse().unwrap()));
+        assert!(!matcher_ref.matches_ip("192.168.10.5".parse().unwrap()));
+        assert_eq!(matcher_ref.cidr_includes_count(), 2);
+        assert_eq!(matcher_ref.fqdn_includes_count(), 3);
+
+        let effective = matcher_ref.effective_included_cidrs();
+        assert_eq!(effective, vec!["172.16.0.0/16".parse::<IpNet>().unwrap()]);
+
+        let pruned = matcher_ref.pruned_search_domains();
+        assert_eq!(pruned, vec!["new.corp".to_string(), "portal.extra.corp".to_string()]);
     }
 }

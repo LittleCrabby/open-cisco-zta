@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 
 const FAKE_IP_START: u32 = 0xc6120001; // 198.18.0.1
 const FAKE_IP_END: u32 = 0xc613fffe;   // 198.19.255.254
+const TCP_DNS_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct FakeIpState {
@@ -45,6 +46,13 @@ impl FakeIpPool {
 
     pub async fn allocate_or_get(&self, domain: &str) -> Ipv4Addr {
         let clean = domain.trim().trim_end_matches('.').to_lowercase();
+        {
+            let s = self.state.read().await;
+            if let Some(&ip) = s.domain_to_ip.get(&clean) {
+                return ip;
+            }
+        }
+
         let mut s = self.state.write().await;
 
         if let Some(&ip) = s.domain_to_ip.get(&clean) {
@@ -161,7 +169,7 @@ impl DnsServer {
             let fake_pool = self.fake_pool.clone();
             tokio::spawn(async move {
                 loop {
-                    let (mut stream, _client_addr) = match listener.accept().await {
+                    let (stream, _client_addr) = match listener.accept().await {
                         Ok(c) => c,
                         Err(e) => {
                             tracing::debug!("DNS TCP accept error: {:?}", e);
@@ -173,27 +181,51 @@ impl DnsServer {
                     let fake_pool = fake_pool.clone();
 
                     tokio::spawn(async move {
-                        let mut len_buf = [0u8; 2];
-                        if stream.read_exact(&mut len_buf).await.is_err() {
-                            return;
-                        }
-                        let req_len = u16::from_be_bytes(len_buf) as usize;
-                        let mut req_buf = vec![0u8; req_len];
-                        if stream.read_exact(&mut req_buf).await.is_err() {
-                            return;
-                        }
-
-                        if let Ok(resp_bytes) = Self::handle_query(&req_buf, router, fake_pool, upstream).await {
-                            let resp_len = (resp_bytes.len() as u16).to_be_bytes();
-                            let _ = stream.write_all(&resp_len).await;
-                            let _ = stream.write_all(&resp_bytes).await;
-                        }
+                        Self::handle_tcp_dns_stream(stream, router, fake_pool, upstream).await;
                     });
                 }
             });
         }
 
         Ok(())
+    }
+
+    /// Reads one length-prefixed DNS-over-TCP query from `stream`, resolves it, and writes
+    /// back the length-prefixed response before shutting down the stream.
+    pub async fn handle_tcp_dns_stream<S>(
+        mut stream: S,
+        router: Arc<RouteMatcher>,
+        fake_pool: FakeIpPool,
+        upstream: SocketAddr,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut len_buf = [0u8; 2];
+        if tokio::time::timeout(TCP_DNS_READ_TIMEOUT, stream.read_exact(&mut len_buf))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .is_none()
+        {
+            return;
+        }
+        let req_len = u16::from_be_bytes(len_buf) as usize;
+        let mut req_buf = vec![0u8; req_len];
+        if tokio::time::timeout(TCP_DNS_READ_TIMEOUT, stream.read_exact(&mut req_buf))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .is_none()
+        {
+            return;
+        }
+
+        if let Ok(resp_bytes) = Self::handle_query(&req_buf, router, fake_pool, upstream).await {
+            let resp_len = (resp_bytes.len() as u16).to_be_bytes();
+            let _ = stream.write_all(&resp_len).await;
+            let _ = stream.write_all(&resp_bytes).await;
+        }
+        let _ = stream.shutdown().await;
     }
 
     pub async fn handle_query(

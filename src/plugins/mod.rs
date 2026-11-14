@@ -1,9 +1,8 @@
 pub mod acidex;
 
-use anyhow::Result;
+pub use acidex::{AcidexPayload, OsProfile};
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use std::net::SocketAddr;
-pub use acidex::{AcidexPayload, OsProfile};
 
 #[derive(Debug, Clone)]
 pub struct FlowInfo {
@@ -14,14 +13,6 @@ pub struct FlowInfo {
 
 pub trait FlowMetadataProvider: Send + Sync {
     fn append_headers(&self, flow: &FlowInfo, headers: &mut HeaderMap);
-}
-
-pub trait PostureProvider: Send + Sync {
-    fn handle_stale_posture(&self, proxy_status: &str) -> Result<()>;
-}
-
-pub trait ProxyAuthProvider: Send + Sync {
-    fn handle_407(&self, target: &str) -> Result<Option<HeaderValue>>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -65,25 +56,5 @@ impl FlowMetadataProvider for DefaultAcidexProvider {
         insert_str("x-acidex-system-vendor", &h.system.hardware_vendor);
         insert_str("x-acidex-system-model", &h.system.hardware_model);
         insert_str("x-acidex-system-serial", &h.system.hardware_serial);
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct NoopPostureProvider;
-
-impl PostureProvider for NoopPostureProvider {
-    fn handle_stale_posture(&self, proxy_status: &str) -> Result<()> {
-        tracing::warn!("Received StalePostureAlert from proxy: {}", proxy_status);
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct NoopProxyAuthProvider;
-
-impl ProxyAuthProvider for NoopProxyAuthProvider {
-    fn handle_407(&self, target: &str) -> Result<Option<HeaderValue>> {
-        tracing::warn!("Proxy authentication required (407) for target: {}", target);
-        Ok(None)
     }
 }

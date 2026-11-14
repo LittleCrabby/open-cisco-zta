@@ -364,6 +364,47 @@ pub(crate) fn build_udp_ip_packets(
     }
 }
 
+/// Resolves a TUN destination `(dst_ip, dst_port)` into a tunnel authority string,
+/// returning `None` if the destination is an unallocated Fake-IP or excluded by CIDR policy.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+async fn resolve_tun_authority(
+    dst_ip: IpAddr,
+    dst_port: u16,
+    local_addr: SocketAddr,
+    proto_label: &str,
+    router: &RouteMatcher,
+    fake_pool: &FakeIpPool,
+) -> Option<String> {
+    match dst_ip {
+        IpAddr::V4(v4) if FakeIpPool::is_fake_ip(v4) => {
+            if let Some(domain) = fake_pool.lookup_domain(v4).await {
+                Some(format!("{}:{}", domain, dst_port))
+            } else {
+                tracing::warn!(
+                    "TUN {} flow from {} to unallocated Fake-IP {}:{}; dropping",
+                    proto_label,
+                    local_addr,
+                    v4,
+                    dst_port
+                );
+                None
+            }
+        }
+        _ => {
+            if !router.matches_ip(dst_ip) {
+                tracing::debug!(
+                    "TUN {} destination {}:{} is excluded by CIDR policy; dropping",
+                    proto_label,
+                    dst_ip,
+                    dst_port
+                );
+                return None;
+            }
+            Some(format!("{}:{}", dst_ip, dst_port))
+        }
+    }
+}
+
 pub struct TunDevice {
     name: String,
     ip: Ipv4Addr,
@@ -597,36 +638,18 @@ impl TunDevice {
                         let udp_sessions_cleanup = Arc::clone(&udp_sessions);
 
                         tokio::spawn(async move {
-                            let dst_ip = remote.ip();
-                            let dst_port = remote.port();
-
-                            let authority = match dst_ip {
-                                IpAddr::V4(v4) if FakeIpPool::is_fake_ip(v4) => {
-                                    if let Some(domain) = fake_pool.lookup_domain(v4).await {
-                                        format!("{}:{}", domain, dst_port)
-                                    } else {
-                                        tracing::warn!(
-                                            "TUN UDP packet from {} to unallocated Fake-IP {}:{}; dropping",
-                                            local,
-                                            v4,
-                                            dst_port
-                                        );
-                                        udp_sessions_cleanup.lock().await.remove(&flow_key);
-                                        return;
-                                    }
-                                }
-                                _ => {
-                                    if !router.matches_ip(dst_ip) {
-                                        tracing::debug!(
-                                            "TUN UDP destination {}:{} is excluded by CIDR policy; dropping",
-                                            dst_ip,
-                                            dst_port
-                                        );
-                                        udp_sessions_cleanup.lock().await.remove(&flow_key);
-                                        return;
-                                    }
-                                    format!("{}:{}", dst_ip, dst_port)
-                                }
+                            let Some(authority) = resolve_tun_authority(
+                                remote.ip(),
+                                remote.port(),
+                                local,
+                                "UDP",
+                                &router,
+                                &fake_pool,
+                            )
+                            .await
+                            else {
+                                udp_sessions_cleanup.lock().await.remove(&flow_key);
+                                return;
                             };
 
                             tracing::info!(
@@ -718,20 +741,8 @@ impl TunDevice {
                         let router = Arc::clone(&router);
                         let fake_pool = fake_pool.clone();
                         tokio::spawn(async move {
-                            let mut len_buf = [0u8; 2];
-                            if stream.read_exact(&mut len_buf).await.is_err() {
-                                return;
-                            }
-                            let req_len = u16::from_be_bytes(len_buf) as usize;
-                            let mut req_buf = vec![0u8; req_len];
-                            if stream.read_exact(&mut req_buf).await.is_err() {
-                                return;
-                            }
-                            if let Ok(resp_bytes) = DnsServer::handle_query(&req_buf, router, fake_pool, upstream).await {
-                                let resp_len = (resp_bytes.len() as u16).to_be_bytes();
-                                let _ = stream.write_all(&resp_len).await;
-                                let _ = stream.write_all(&resp_bytes).await;
-                            }
+                            DnsServer::handle_tcp_dns_stream(stream, router, fake_pool, upstream)
+                                .await;
                         });
                         continue;
                     }
@@ -742,34 +753,18 @@ impl TunDevice {
                     let router = Arc::clone(&router);
 
                     tokio::spawn(async move {
-                        let dst_ip = peer_addr.ip();
-                        let dst_port = peer_addr.port();
-
-                        let authority = match dst_ip {
-                            IpAddr::V4(v4) if FakeIpPool::is_fake_ip(v4) => {
-                                if let Some(domain) = fake_pool.lookup_domain(v4).await {
-                                    format!("{}:{}", domain, dst_port)
-                                } else {
-                                    tracing::warn!(
-                                        "TUN TCP connection from {} to unallocated Fake-IP {}:{}; dropping",
-                                        local_addr,
-                                        v4,
-                                        dst_port
-                                    );
-                                    return;
-                                }
-                            }
-                            _ => {
-                                if !router.matches_ip(dst_ip) {
-                                    tracing::debug!(
-                                        "TUN TCP destination {}:{} is excluded by CIDR policy; dropping",
-                                        dst_ip,
-                                        dst_port
-                                    );
-                                    return;
-                                }
-                                format!("{}:{}", dst_ip, dst_port)
-                            }
+                        let Some(authority) = resolve_tun_authority(
+                            peer_addr.ip(),
+                            peer_addr.port(),
+                            local_addr,
+                            "TCP",
+                            &router,
+                            &fake_pool,
+                        )
+                        .await
+                        else {
+                            let _ = stream.shutdown().await;
+                            return;
                         };
 
                         tracing::info!(
@@ -779,15 +774,19 @@ impl TunDevice {
                         );
 
                         match mux.open_tcp_tunnel(&authority, Some(local_addr)).await {
-                            Ok(mut tunnel) => {
-                                let _ = crate::dataplane::mux::relay_bidirectional(
-                                    &mut stream,
-                                    &mut tunnel,
-                                )
-                                .await;
+                            Ok(tunnel) => {
+                                let _ = mux
+                                    .relay_tcp_stream(
+                                        &mut stream,
+                                        tunnel,
+                                        &authority,
+                                        Some(local_addr),
+                                    )
+                                    .await;
                             }
                             Err(e) => {
                                 tracing::error!("Failed to tunnel TCP connection to {}: {:?}", authority, e);
+                                let _ = stream.shutdown().await;
                             }
                         }
                     });
